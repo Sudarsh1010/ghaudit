@@ -62,6 +62,10 @@ function App() {
       source.addEventListener('tool_invoked', handle('tool_invoked'))
       source.addEventListener('tool_result', handle('tool_result'))
       source.addEventListener('question_asked', handle('question_asked'))
+      source.addEventListener(
+        'prd_section_written',
+        handle('prd_section_written'),
+      )
       source.addEventListener('done', handle('done'))
       source.onerror = () => source.close()
     } catch (err) {
@@ -105,37 +109,87 @@ function App() {
       )}
 
       {session && (
-        <section className="space-y-2">
-          <div className="text-xs text-gray-500">
-            session: <code>{session.sessionId}</code>
+        <section className="grid gap-4 lg:grid-cols-2">
+          <div className="space-y-2">
+            <div className="text-xs text-gray-500">
+              session: <code>{session.sessionId}</code>
+            </div>
+            <ol className="space-y-2">
+              {events.map((evt) =>
+                evt.type === 'question_asked' ? (
+                  <li key={evt.id}>
+                    <QuestionCard
+                      sessionId={session.sessionId}
+                      question={evt as QuestionAskedEvent}
+                    />
+                  </li>
+                ) : (
+                  <li
+                    key={evt.id}
+                    className="rounded border border-gray-200 p-2 text-sm"
+                  >
+                    <div className="text-xs uppercase tracking-wide text-gray-500">
+                      {evt.type}
+                    </div>
+                    <pre className="whitespace-pre-wrap text-sm">
+                      {renderEvent(evt)}
+                    </pre>
+                  </li>
+                ),
+              )}
+            </ol>
           </div>
-          <ol className="space-y-2">
-            {events.map((evt) =>
-              evt.type === 'question_asked' ? (
-                <li key={evt.id}>
-                  <QuestionCard
-                    sessionId={session.sessionId}
-                    question={evt as QuestionAskedEvent}
-                  />
-                </li>
-              ) : (
-                <li
-                  key={evt.id}
-                  className="rounded border border-gray-200 p-2 text-sm"
-                >
-                  <div className="text-xs uppercase tracking-wide text-gray-500">
-                    {evt.type}
-                  </div>
-                  <pre className="whitespace-pre-wrap text-sm">
-                    {renderEvent(evt)}
-                  </pre>
-                </li>
-              ),
-            )}
-          </ol>
+          <PrdPane sessionId={session.sessionId} events={events} />
         </section>
       )}
     </main>
+  )
+}
+
+function PrdPane({
+  sessionId,
+  events,
+}: {
+  sessionId: string
+  events: Array<AgentEvent>
+}) {
+  const sections = new Map<string, string>()
+  for (const evt of events) {
+    if (evt.type === 'prd_section_written') {
+      sections.set(evt.section, evt.content)
+    }
+  }
+  const isDone = events.some((e) => e.type === 'done')
+
+  return (
+    <aside className="space-y-2 rounded border border-gray-200 bg-gray-50 p-3">
+      <div className="flex items-center justify-between">
+        <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-700">
+          PRD
+        </h2>
+        {isDone && (
+          <a
+            href={`/session/${sessionId}/prd`}
+            className="text-xs text-blue-700 underline"
+          >
+            Download .md
+          </a>
+        )}
+      </div>
+      {sections.size === 0 && (
+        <div className="text-xs text-gray-500">
+          PRD sections will appear here as the agent writes them.
+        </div>
+      )}
+      {[...sections.entries()].map(([section, content]) => (
+        <div key={section}>
+          <div className="text-xs font-semibold uppercase text-gray-500">
+            {section}
+          </div>
+          <div className="whitespace-pre-wrap text-sm">{content}</div>
+        </div>
+      ))}
+    </aside>
   )
 }
 
@@ -151,5 +205,7 @@ function renderEvent(evt: AgentEvent): string {
       return evt.finalText
     case 'question_asked':
       return `${evt.question}\n\n→ recommendation: ${evt.recommendation}\n→ rationale: ${evt.rationale}`
+    case 'prd_section_written':
+      return `[${evt.section}] ${evt.content.slice(0, 80)}…`
   }
 }

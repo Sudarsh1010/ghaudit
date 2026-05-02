@@ -8,6 +8,7 @@ export type AgentEvent =
   | ToolInvokedEvent
   | ToolResultEvent
   | QuestionAskedEvent
+  | PrdSectionWrittenEvent
   | DoneEvent
 
 export interface AgentThinkingEvent {
@@ -40,6 +41,13 @@ export interface QuestionAskedEvent {
   kind: 'single'
 }
 
+export interface PrdSectionWrittenEvent {
+  id: number
+  type: 'prd_section_written'
+  section: string
+  content: string
+}
+
 export interface DoneEvent {
   id: number
   type: 'done'
@@ -51,6 +59,7 @@ const KNOWN_TYPES = new Set<AgentEvent['type']>([
   'tool_invoked',
   'tool_result',
   'question_asked',
+  'prd_section_written',
   'done',
 ])
 

@@ -91,11 +91,18 @@ export const runStreamingTick = async (
       return { kind: 'paused', questionId: result.questionId }
     }
 
+    const renderable =
+      result.kind === 'continue'
+        ? result.result
+        : result.kind === 'write_output'
+          ? result.output
+          : { summary: (result as { summary: string }).summary }
+
     await emit({
       id: nextId++,
       type: 'tool_result',
       toolName: call.function.name,
-      result: result.result,
+      result: renderable,
     })
   }
 

@@ -75,4 +75,64 @@ describe('tool registry dispatch', () => {
       dispatch({ name: 'mystery', arguments: {} }, c),
     ).rejects.toThrow(/unknown tool/i)
   })
+
+  it('writeOutput(prd_section) persists the section and returns write_output', async () => {
+    const written: Array<{ section: string; content: string }> = []
+    const result = await dispatch(
+      {
+        name: 'writeOutput',
+        arguments: {
+          kind: 'prd_section',
+          section: 'goal',
+          content: 'Build dark mode.',
+        },
+      },
+      {
+        sessionId: 's',
+        persistQuestion: async () => {},
+        writePrdSection: async (input) => {
+          written.push(input)
+        },
+      },
+    )
+    expect(result).toEqual({
+      kind: 'write_output',
+      output: { kind: 'prd_section', section: 'goal', content: 'Build dark mode.' },
+    })
+    expect(written).toEqual([
+      { section: 'goal', content: 'Build dark mode.' },
+    ])
+  })
+
+  it('writeOutput with unsupported kind returns not_implemented', async () => {
+    const result = await dispatch(
+      {
+        name: 'writeOutput',
+        arguments: { kind: 'open_question', section: 'x', content: 'y' },
+      },
+      {
+        sessionId: 's',
+        persistQuestion: async () => {},
+      },
+    )
+    expect(result).toEqual({
+      kind: 'continue',
+      result: { status: 'not_implemented', kind: 'open_question' },
+    })
+  })
+
+  it('finalize requires a summary and returns finalize', async () => {
+    const result = await dispatch(
+      { name: 'finalize', arguments: { summary: 'shipped' } },
+      { sessionId: 's', persistQuestion: async () => {} },
+    )
+    expect(result).toEqual({ kind: 'finalize', summary: 'shipped' })
+
+    await expect(
+      dispatch(
+        { name: 'finalize', arguments: {} },
+        { sessionId: 's', persistQuestion: async () => {} },
+      ),
+    ).rejects.toThrow(/summary/)
+  })
 })

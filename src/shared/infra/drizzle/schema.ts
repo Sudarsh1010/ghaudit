@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm'
-import { sqliteTable } from 'drizzle-orm/sqlite-core'
+import { sqliteTable, uniqueIndex } from 'drizzle-orm/sqlite-core'
 
 /**
  * Lifecycle of a Research Session.
@@ -152,16 +152,23 @@ export const researchOpenQs = sqliteTable('research_open_qs', (schema) => ({
  * Named sections of the PRD as the agent writes them via writeOutput.
  * Empty in Slice 1.
  */
-export const prdSections = sqliteTable('prd_sections', (schema) => ({
-  id: schema.integer().primaryKey({ autoIncrement: true }),
-  sessionId: schema
-    .text({ length: 40 })
-    .notNull()
-    .references(() => researchSessions.id, { onDelete: 'cascade' }),
-  section: schema.text().notNull(),
-  content: schema.text().notNull(),
-  updatedAt: schema
-    .integer({ mode: 'timestamp' })
-    .notNull()
-    .default(sql`(unixepoch())`),
-}))
+export const prdSections = sqliteTable(
+  'prd_sections',
+  (schema) => ({
+    id: schema.integer().primaryKey({ autoIncrement: true }),
+    sessionId: schema
+      .text({ length: 40 })
+      .notNull()
+      .references(() => researchSessions.id, { onDelete: 'cascade' }),
+    section: schema.text().notNull(),
+    content: schema.text().notNull(),
+    updatedAt: schema
+      .integer({ mode: 'timestamp' })
+      .notNull()
+      .default(sql`(unixepoch())`),
+  }),
+  (table) => [uniqueIndex('prd_sections_session_section_uq').on(
+    table.sessionId,
+    table.section,
+  )],
+)

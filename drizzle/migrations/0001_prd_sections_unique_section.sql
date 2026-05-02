@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX `prd_sections_session_section_uq` ON `prd_sections` (`session_id`,`section`);

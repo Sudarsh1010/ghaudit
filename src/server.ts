@@ -71,6 +71,16 @@ const handleStream = async (
 
 const STREAM_PATH = /^\/session\/([^/]+)\/stream$/
 const ANSWER_PATH = /^\/session\/([^/]+)\/answer\/([^/]+)$/
+const PRD_PATH = /^\/session\/([^/]+)\/prd$/
+
+const handlePrd = async (sessionId: string, env: Env): Promise<Response> => {
+  const namespace = env.RESEARCH_DO as unknown as {
+    idFromName: (n: string) => unknown
+    get: (id: unknown) => { fetch: typeof fetch }
+  }
+  const stub = namespace.get(namespace.idFromName(sessionId))
+  return stub.fetch('https://do/prd', { method: 'GET' })
+}
 
 const handleAnswer = async (
   sessionId: string,
@@ -107,6 +117,11 @@ export default {
     const a = url.pathname.match(ANSWER_PATH)
     if (a && request.method === 'POST') {
       return handleAnswer(a[1]!, a[2]!, request, env)
+    }
+
+    const p = url.pathname.match(PRD_PATH)
+    if (p && request.method === 'GET') {
+      return handlePrd(p[1]!, env)
     }
 
     return handler.fetch(request, {

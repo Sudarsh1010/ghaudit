@@ -1,15 +1,16 @@
 import type { worker } from '../../alchemy.run'
 import { DurableObject } from 'cloudflare:workers'
 import { drizzle } from 'drizzle-orm/d1'
-import { eq } from 'drizzle-orm'
+import { eq, and, asc } from 'drizzle-orm'
 import { createGroqClient } from '~/shared/infra/groq/client'
-import { runStreamingTick } from '~/shared/research/streaming-agent'
+import { runLoop } from '~/shared/agent/loop'
 import { encode, type AgentEvent } from '~/shared/sse/events'
 import { transition, type SessionState } from '~/shared/session/state-machine'
 import {
   researchSessions,
   researchSteps,
   researchQuestions,
+  prdSections,
   ResearchSessionStatus,
   ResearchStepStatus,
 } from '~/shared/infra/drizzle/schema'
@@ -34,9 +35,7 @@ const STATE_TO_DB: Record<SessionState, ResearchSessionStatus> = {
 
 /**
  * One Research Session lives in one ResearchDO instance, keyed by session id.
- *
- * Slice 3 scope: a single tick may now PAUSE on askQuestion, transitioning
- * the session to WAITING_FOR_USER until the worker delivers an answer.
+ * Slice 4: multi-turn loop with finalize, writeOutput(prd_section), step caps.
  */
 export class ResearchDO extends DurableObject {
   declare env: typeof worker.Env
@@ -57,6 +56,9 @@ export class ResearchDO extends DurableObject {
     if (request.method === 'POST' && url.pathname === '/answer') {
       const body = (await request.json()) as AnswerRequestBody
       return this.handleAnswer(body)
+    }
+    if (request.method === 'GET' && url.pathname === '/prd') {
+      return this.assemblePrd()
     }
     return new Response('Not found', { status: 404 })
   }
@@ -91,7 +93,7 @@ export class ResearchDO extends DurableObject {
 
     void (async () => {
       try {
-        const result = await runStreamingTick({
+        const result = await runLoop({
           sessionId,
           prompt,
           groq,
@@ -106,13 +108,25 @@ export class ResearchDO extends DurableObject {
               rationale: q.rationale,
             })
           },
+          writePrdSection: async ({ section, content }) => {
+            await this.db
+              .insert(prdSections)
+              .values({ sessionId, section, content })
+              .onConflictDoUpdate({
+                target: [prdSections.sessionId, prdSections.section],
+                set: { content, updatedAt: new Date() },
+              })
+          },
         })
 
-        if (result.kind === 'paused') {
+        if (result.halt === 'paused') {
           const t = transition(this.state, 'askQuestion')
           if (t.ok) await this.setState(t.state)
-        } else {
+        } else if (result.halt === 'finalized') {
           const t = transition(this.state, 'finalize')
+          if (t.ok) await this.setState(t.state)
+        } else {
+          const t = transition(this.state, 'fail')
           if (t.ok) await this.setState(t.state)
         }
       } catch (err) {
@@ -152,7 +166,12 @@ export class ResearchDO extends DurableObject {
     const [question] = await this.db
       .select()
       .from(researchQuestions)
-      .where(eq(researchQuestions.id, body.questionId))
+      .where(
+        and(
+          eq(researchQuestions.id, body.questionId),
+          eq(researchQuestions.sessionId, this.sessionId),
+        ),
+      )
       .limit(1)
 
     if (!question || question.userReply !== null) {
@@ -176,6 +195,41 @@ export class ResearchDO extends DurableObject {
     return Response.json({ ok: true, state: this.state })
   }
 
+  private async assemblePrd(): Promise<Response> {
+    const [row] = await this.db
+      .select()
+      .from(researchSessions)
+      .where(eq(researchSessions.id, this.sessionId))
+      .limit(1)
+
+    if (!row) return new Response('session not found', { status: 404 })
+    if (row.status !== ResearchSessionStatus.completed) {
+      return new Response(
+        `PRD not ready (session is ${row.status}). Finalize the session first.`,
+        { status: 409 },
+      )
+    }
+
+    const sections = await this.db
+      .select()
+      .from(prdSections)
+      .where(eq(prdSections.sessionId, this.sessionId))
+      .orderBy(asc(prdSections.id))
+
+    const body = sections
+      .map((s) => `## ${humanise(s.section)}\n\n${s.content}\n`)
+      .join('\n')
+
+    const md = `# PRD: ${row.initialPrompt}\n\n${body || '_(no sections written)_'}\n`
+
+    return new Response(md, {
+      headers: {
+        'content-type': 'text/markdown; charset=utf-8',
+        'content-disposition': `attachment; filename="prd-${this.sessionId}.md"`,
+      },
+    })
+  }
+
   private async persistStep(event: AgentEvent): Promise<void> {
     await this.db.insert(researchSteps).values({
       sessionId: this.sessionId,
@@ -195,3 +249,6 @@ export class ResearchDO extends DurableObject {
     })
   }
 }
+
+const humanise = (slug: string): string =>
+  slug.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())

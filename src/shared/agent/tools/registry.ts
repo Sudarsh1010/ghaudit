@@ -17,9 +17,16 @@ export interface PersistQuestionInput {
   kind: 'single'
 }
 
+export interface WritePrdSectionInput {
+  section: string
+  content: string
+}
+
 export interface ToolDispatchContext {
   sessionId: string
   persistQuestion: (input: PersistQuestionInput) => Promise<void>
+  /** Upserts (sessionId, section) → content into prd_sections. */
+  writePrdSection?: (input: WritePrdSectionInput) => Promise<void>
   generateId?: () => string
 }
 
@@ -40,6 +47,11 @@ export type ToolResult =
         kind: 'single'
       }
     }
+  | {
+      kind: 'write_output'
+      output: { kind: 'prd_section'; section: string; content: string }
+    }
+  | { kind: 'finalize'; summary: string }
 
 export const dispatch = async (
   call: ToolCall,
@@ -50,9 +62,41 @@ export const dispatch = async (
       return dispatchAskQuestion(call.arguments, ctx)
     case 'echo':
       return { kind: 'continue', result: parseEchoArgs(call.arguments) }
+    case 'writeOutput':
+      return dispatchWriteOutput(call.arguments, ctx)
+    case 'finalize':
+      return dispatchFinalize(call.arguments)
     default:
       throw new Error(`Unknown tool: ${call.name}`)
   }
+}
+
+const dispatchWriteOutput = async (
+  args: unknown,
+  ctx: ToolDispatchContext,
+): Promise<ToolResult> => {
+  if (!isObject(args)) throw new Error('writeOutput: arguments must be object')
+  const kind = requireString(args, 'kind')
+  if (kind !== 'prd_section') {
+    return { kind: 'continue', result: { status: 'not_implemented', kind } }
+  }
+  const section = requireString(args, 'section')
+  const content = requireString(args, 'content')
+
+  if (ctx.writePrdSection) {
+    await ctx.writePrdSection({ section, content })
+  }
+
+  return {
+    kind: 'write_output',
+    output: { kind: 'prd_section', section, content },
+  }
+}
+
+const dispatchFinalize = async (args: unknown): Promise<ToolResult> => {
+  if (!isObject(args)) throw new Error('finalize: arguments must be object')
+  const summary = requireString(args, 'summary')
+  return { kind: 'finalize', summary }
 }
 
 const dispatchAskQuestion = async (
@@ -119,6 +163,46 @@ export const TOOLS: Array<OpenAI.ChatCompletionTool> = [
         type: 'object',
         properties: { text: { type: 'string' } },
         required: ['text'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'writeOutput',
+      description:
+        'Write a section of the PRD. The only kind currently supported is `prd_section`.',
+      parameters: {
+        type: 'object',
+        properties: {
+          kind: { type: 'string', enum: ['prd_section'] },
+          section: {
+            type: 'string',
+            description: 'PRD section name (goal, users, scope, …).',
+          },
+          content: { type: 'string', description: 'Section content (markdown).' },
+        },
+        required: ['kind', 'section', 'content'],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'finalize',
+      description:
+        'Close the Research Session and ship the PRD. Call this only after every section is written.',
+      parameters: {
+        type: 'object',
+        properties: {
+          summary: {
+            type: 'string',
+            description: 'One-line summary of what was decided.',
+          },
+        },
+        required: ['summary'],
         additionalProperties: false,
       },
     },
