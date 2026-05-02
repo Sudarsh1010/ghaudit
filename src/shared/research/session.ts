@@ -1,4 +1,3 @@
-import type { AgentTickOutput } from './agent'
 import { ResearchSessionStatus } from '~/shared/infra/drizzle/schema'
 
 export interface CreateSessionInput {
@@ -7,7 +6,7 @@ export interface CreateSessionInput {
 
 export interface CreateSessionOutput {
   sessionId: string
-  response: string
+  eventStreamUrl: string
 }
 
 export interface SessionDeps {
@@ -19,11 +18,12 @@ export interface SessionDeps {
     createdAt: Date
     updatedAt: Date
   }) => Promise<void>
-  /** Spawns the Durable Object for this session and runs one tick(). */
-  spawnAgentTick: (
-    sessionId: string,
-    prompt: string,
-  ) => Promise<AgentTickOutput>
+  /**
+   * Builds the SSE URL the client should subscribe to for this session.
+   * Injected so the worker can choose between absolute / relative URLs and
+   * tests can assert on a stable shape.
+   */
+  buildEventStreamUrl: (sessionId: string) => string
   generateId?: () => string
   now?: () => Date
 }
@@ -31,10 +31,9 @@ export interface SessionDeps {
 /**
  * Use case: start a new Research Session.
  *
- * Persists the session row, spawns its Durable Object, runs one Agent Loop
- * tick, and returns the agent's response. This is the Slice 1 happy-path
- * orchestration; later slices replace `spawnAgentTick` with a streaming
- * channel and add 5-state transitions.
+ * Persists the session row and returns the URL the UI should subscribe to
+ * for live agent events. The agent loop itself is kicked off by the SSE
+ * stream handler when the client connects.
  */
 export const createSession = async (
   input: CreateSessionInput,
@@ -56,9 +55,7 @@ export const createSession = async (
     updatedAt: now,
   })
 
-  const tickResult = await deps.spawnAgentTick(id, initialPrompt)
-
-  return { sessionId: id, response: tickResult.text }
+  return { sessionId: id, eventStreamUrl: deps.buildEventStreamUrl(id) }
 }
 
 const defaultGenerateId = (): string => {

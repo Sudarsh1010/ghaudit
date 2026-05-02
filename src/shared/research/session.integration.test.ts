@@ -1,21 +1,16 @@
 import { describe, it, expect, vi } from 'vitest'
 import { createSession } from './session'
-import type { AgentTickOutput } from './agent'
 
 /**
- * Slice 1 happy-path: simulates what the worker entry does for `POST /session`
- * by wiring `createSession` to an in-memory "table" and a fake DO stub that
- * resolves a canned tick result.
+ * Slice 2 happy-path: simulates what the worker entry does for `POST /session`
+ * by wiring `createSession` to an in-memory "table" and a fake URL builder.
+ * The actual streaming is exercised by `streaming-agent.test.ts`.
  */
-describe('POST /session happy path (mocked DO + LLM)', () => {
-  it('persists a session row, calls the DO once, and returns the response', async () => {
+describe('POST /session happy path (slice 2)', () => {
+  it('persists a session row and returns the eventStreamUrl', async () => {
     const sessionsTable: Array<unknown> = []
-
-    const fakeDoFetch = vi.fn(
-      async (): Promise<AgentTickOutput> => ({
-        text: 'agent says hi',
-        toolCalls: [],
-      }),
+    const buildEventStreamUrl = vi.fn(
+      (id: string) => `/session/${id}/stream`,
     )
 
     const result = await createSession(
@@ -24,18 +19,13 @@ describe('POST /session happy path (mocked DO + LLM)', () => {
         insertSession: async (row) => {
           sessionsTable.push(row)
         },
-        spawnAgentTick: async (sessionId, prompt) => {
-          // Simulate the worker dispatching to the Durable Object.
-          expect(sessionId).toMatch(/^rs_/)
-          expect(prompt).toBe('help me write a PRD')
-          return fakeDoFetch()
-        },
+        buildEventStreamUrl,
       },
     )
 
     expect(result.sessionId).toMatch(/^rs_/)
-    expect(result.response).toBe('agent says hi')
+    expect(result.eventStreamUrl).toBe(`/session/${result.sessionId}/stream`)
     expect(sessionsTable).toHaveLength(1)
-    expect(fakeDoFetch).toHaveBeenCalledOnce()
+    expect(buildEventStreamUrl).toHaveBeenCalledOnce()
   })
 })

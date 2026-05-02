@@ -2,21 +2,17 @@ import { describe, it, expect, vi } from 'vitest'
 import { createSession } from './session'
 
 describe('createSession', () => {
-  it('persists a research_sessions row, runs the DO tick, returns the response text', async () => {
+  it('persists a research_sessions row and returns the SSE stream URL', async () => {
     const insertSession =
       vi.fn<(row: { id: string; initialPrompt: string; status: string }) => Promise<void>>(
         async () => {},
       )
-    const spawnAgentTick = vi.fn(async () => ({
-      text: 'agent says hi',
-      toolCalls: [],
-    }))
 
     const result = await createSession(
       { initialPrompt: 'help me write a PRD' },
       {
         insertSession,
-        spawnAgentTick,
+        buildEventStreamUrl: (id) => `/session/${id}/stream`,
         generateId: () => 'rs_fixed',
         now: () => new Date(1700000000000),
       },
@@ -24,7 +20,7 @@ describe('createSession', () => {
 
     expect(result).toEqual({
       sessionId: 'rs_fixed',
-      response: 'agent says hi',
+      eventStreamUrl: '/session/rs_fixed/stream',
     })
 
     expect(insertSession).toHaveBeenCalledOnce()
@@ -34,11 +30,6 @@ describe('createSession', () => {
       initialPrompt: 'help me write a PRD',
       status: 'active',
     })
-
-    expect(spawnAgentTick).toHaveBeenCalledWith(
-      'rs_fixed',
-      'help me write a PRD',
-    )
   })
 
   it('rejects when initialPrompt is empty', async () => {
@@ -47,7 +38,7 @@ describe('createSession', () => {
         { initialPrompt: '   ' },
         {
           insertSession: vi.fn(),
-          spawnAgentTick: vi.fn(),
+          buildEventStreamUrl: () => '/x',
         },
       ),
     ).rejects.toThrow(/initialPrompt/)
