@@ -1,6 +1,7 @@
 import { createFileRoute } from '@tanstack/react-router'
 import { useEffect, useRef, useState } from 'react'
-import type { AgentEvent } from '~/shared/sse/events'
+import type { AgentEvent, QuestionAskedEvent } from '~/shared/sse/events'
+import { QuestionCard } from '~/components/question-card'
 
 export const Route = createFileRoute('/')({ component: App })
 
@@ -60,6 +61,7 @@ function App() {
       source.addEventListener('agent_thinking', handle('agent_thinking'))
       source.addEventListener('tool_invoked', handle('tool_invoked'))
       source.addEventListener('tool_result', handle('tool_result'))
+      source.addEventListener('question_asked', handle('question_asked'))
       source.addEventListener('done', handle('done'))
       source.onerror = () => source.close()
     } catch (err) {
@@ -108,19 +110,28 @@ function App() {
             session: <code>{session.sessionId}</code>
           </div>
           <ol className="space-y-2">
-            {events.map((evt) => (
-              <li
-                key={evt.id}
-                className="rounded border border-gray-200 p-2 text-sm"
-              >
-                <div className="text-xs uppercase tracking-wide text-gray-500">
-                  {evt.type}
-                </div>
-                <pre className="whitespace-pre-wrap text-sm">
-                  {renderEvent(evt)}
-                </pre>
-              </li>
-            ))}
+            {events.map((evt) =>
+              evt.type === 'question_asked' ? (
+                <li key={evt.id}>
+                  <QuestionCard
+                    sessionId={session.sessionId}
+                    question={evt as QuestionAskedEvent}
+                  />
+                </li>
+              ) : (
+                <li
+                  key={evt.id}
+                  className="rounded border border-gray-200 p-2 text-sm"
+                >
+                  <div className="text-xs uppercase tracking-wide text-gray-500">
+                    {evt.type}
+                  </div>
+                  <pre className="whitespace-pre-wrap text-sm">
+                    {renderEvent(evt)}
+                  </pre>
+                </li>
+              ),
+            )}
           </ol>
         </section>
       )}
@@ -138,5 +149,7 @@ function renderEvent(evt: AgentEvent): string {
       return `→ ${JSON.stringify(evt.result)}`
     case 'done':
       return evt.finalText
+    case 'question_asked':
+      return `${evt.question}\n\n→ recommendation: ${evt.recommendation}\n→ rationale: ${evt.rationale}`
   }
 }

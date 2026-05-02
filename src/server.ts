@@ -70,6 +70,26 @@ const handleStream = async (
 }
 
 const STREAM_PATH = /^\/session\/([^/]+)\/stream$/
+const ANSWER_PATH = /^\/session\/([^/]+)\/answer\/([^/]+)$/
+
+const handleAnswer = async (
+  sessionId: string,
+  questionId: string,
+  request: Request,
+  env: Env,
+): Promise<Response> => {
+  const namespace = env.RESEARCH_DO as unknown as {
+    idFromName: (n: string) => unknown
+    get: (id: unknown) => { fetch: typeof fetch }
+  }
+  const stub = namespace.get(namespace.idFromName(sessionId))
+  const body = await request.text()
+  return stub.fetch('https://do/answer', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ...JSON.parse(body || '{}'), questionId }),
+  })
+}
 
 export default {
   async fetch(request: Request, env: Env) {
@@ -82,6 +102,11 @@ export default {
     const m = url.pathname.match(STREAM_PATH)
     if (m && request.method === 'GET') {
       return handleStream(m[1]!, env)
+    }
+
+    const a = url.pathname.match(ANSWER_PATH)
+    if (a && request.method === 'POST') {
+      return handleAnswer(a[1]!, a[2]!, request, env)
     }
 
     return handler.fetch(request, {
