@@ -1,73 +1,167 @@
+import { sql } from 'drizzle-orm'
 import { sqliteTable } from 'drizzle-orm/sqlite-core'
 
-export enum AuditStatus {
-  pending = 'pending',
-  running = 'running',
+/**
+ * Lifecycle of a Research Session.
+ * The 5-state machine matures across slices; only `active`, `completed`,
+ * `abandoned` are actually written by Slice 1.
+ */
+export enum ResearchSessionStatus {
+  active = 'active',
+  waitingForUser = 'waiting_for_user',
+  finalising = 'finalising',
   completed = 'completed',
+  abandoned = 'abandoned',
   failed = 'failed',
 }
 
-export enum AuditStepStatus {
-  failure = 'failure',
+export enum ResearchStepStatus {
   success = 'success',
+  failure = 'failure',
 }
 
 /**
- * Main audit session record.
+ * One end-to-end interview producing one PRD.
  */
-export const audits = sqliteTable('audits', (schema) => ({
-  id: schema.text({ length: 34 }).primaryKey(), // e.g., audit_xxxxxx
-  repoUrl: schema.text().notNull(),
-  status: schema
-    .text({
-      mode: 'text',
-      length: 9,
-      enum: Object.values(AuditStatus) as [AuditStatus, ...AuditStatus[]],
-    })
-    .notNull(),
-  createdAt: schema.integer({ mode: 'timestamp' }).notNull(),
-  updatedAt: schema.integer({ mode: 'timestamp' }).notNull(),
-}))
+export const researchSessions = sqliteTable(
+  'research_sessions',
+  (schema) => ({
+    id: schema.text({ length: 40 }).primaryKey(), // e.g. rs_xxxxxx
+    initialPrompt: schema.text().notNull(),
+    status: schema
+      .text({
+        mode: 'text',
+        length: 20,
+        enum: Object.values(ResearchSessionStatus) as [
+          ResearchSessionStatus,
+          ...ResearchSessionStatus[],
+        ],
+      })
+      .notNull(),
+    createdAt: schema
+      .integer({ mode: 'timestamp' })
+      .notNull()
+      .default(sql`(unixepoch())`),
+    updatedAt: schema
+      .integer({ mode: 'timestamp' })
+      .notNull()
+      .default(sql`(unixepoch())`),
+  }),
+)
 
 /**
- * Immutable log of every step in the agent loop.
- * Enables full traceability & replay.
+ * Append-only log of every iteration of the Agent Loop for a Research
+ * Session. Persists prompts, responses, tool calls and outcomes.
  */
-export const auditSteps = sqliteTable('audit_steps', (schema) => ({
+export const researchSteps = sqliteTable('research_steps', (schema) => ({
   id: schema.integer().primaryKey({ autoIncrement: true }),
-  auditId: schema
-    .text({ length: 34 })
+  sessionId: schema
+    .text({ length: 40 })
     .notNull()
-    .references(() => audits.id, { onDelete: 'cascade' }),
-
-  stepNumber: schema.integer().notNull(), // 1 to 10
-  toolName: schema.text(), // e.g., "fetchRepoMetadata"
+    .references(() => researchSessions.id, { onDelete: 'cascade' }),
+  stepNumber: schema.integer().notNull(),
+  toolName: schema.text(),
   llmPrompt: schema.text(),
-  llmResponse: schema.text(), // raw JSON from Llama
-  toolRequest: schema.text(), // e.g., "{ owner: '...', repo: '...' }"
-  toolResponse: schema.text(), // raw GitHub API response
-  errorMessage: schema.text(), // if step failed
+  llmResponse: schema.text(),
+  toolRequest: schema.text(),
+  toolResponse: schema.text(),
+  errorMessage: schema.text(),
   status: schema
     .text({
-      length: 7,
       mode: 'text',
-      enum: Object.values(AuditStepStatus) as [
-        AuditStepStatus,
-        ...AuditStepStatus[],
+      length: 7,
+      enum: Object.values(ResearchStepStatus) as [
+        ResearchStepStatus,
+        ...ResearchStepStatus[],
       ],
     })
     .notNull(),
-  timestamp: schema.integer({ mode: 'timestamp' }).notNull(),
+  createdAt: schema
+    .integer({ mode: 'timestamp' })
+    .notNull()
+    .default(sql`(unixepoch())`),
 }))
 
 /**
- * Final human-readable report (Markdown/JSON).
+ * Each HITL askQuestion call recorded with its recommended answer and the
+ * user's eventual reply. Empty in Slice 1.
  */
-export const auditReports = sqliteTable('audit_reports', (schema) => ({
-  auditId: schema
-    .text({ length: 34 })
-    .primaryKey()
-    .references(() => audits.id, { onDelete: 'cascade' }),
-  content: schema.text().notNull(), // final report
-  createdAt: schema.integer({ mode: 'timestamp' }).notNull(),
+export const researchQuestions = sqliteTable(
+  'research_questions',
+  (schema) => ({
+    id: schema.text({ length: 40 }).primaryKey(),
+    sessionId: schema
+      .text({ length: 40 })
+      .notNull()
+      .references(() => researchSessions.id, { onDelete: 'cascade' }),
+    stepId: schema
+      .integer()
+      .references(() => researchSteps.id, { onDelete: 'set null' }),
+    question: schema.text().notNull(),
+    recommendedAnswer: schema.text().notNull(),
+    rationale: schema.text().notNull(),
+    userReply: schema.text(),
+    askedAt: schema
+      .integer({ mode: 'timestamp' })
+      .notNull()
+      .default(sql`(unixepoch())`),
+    answeredAt: schema.integer({ mode: 'timestamp' }),
+  }),
+)
+
+/**
+ * Glossary terms collected during the interview. Empty in Slice 1.
+ */
+export const researchGlossary = sqliteTable(
+  'research_glossary',
+  (schema) => ({
+    id: schema.integer().primaryKey({ autoIncrement: true }),
+    sessionId: schema
+      .text({ length: 40 })
+      .notNull()
+      .references(() => researchSessions.id, { onDelete: 'cascade' }),
+    term: schema.text().notNull(),
+    definition: schema.text().notNull(),
+    avoidTerms: schema.text(), // JSON array string
+    createdAt: schema
+      .integer({ mode: 'timestamp' })
+      .notNull()
+      .default(sql`(unixepoch())`),
+  }),
+)
+
+/**
+ * Open questions surfaced during the interview but deferred to the PRD's
+ * Open Questions section. Empty in Slice 1.
+ */
+export const researchOpenQs = sqliteTable('research_open_qs', (schema) => ({
+  id: schema.integer().primaryKey({ autoIncrement: true }),
+  sessionId: schema
+    .text({ length: 40 })
+    .notNull()
+    .references(() => researchSessions.id, { onDelete: 'cascade' }),
+  question: schema.text().notNull(),
+  context: schema.text(),
+  createdAt: schema
+    .integer({ mode: 'timestamp' })
+    .notNull()
+    .default(sql`(unixepoch())`),
+}))
+
+/**
+ * Named sections of the PRD as the agent writes them via writeOutput.
+ * Empty in Slice 1.
+ */
+export const prdSections = sqliteTable('prd_sections', (schema) => ({
+  id: schema.integer().primaryKey({ autoIncrement: true }),
+  sessionId: schema
+    .text({ length: 40 })
+    .notNull()
+    .references(() => researchSessions.id, { onDelete: 'cascade' }),
+  section: schema.text().notNull(),
+  content: schema.text().notNull(),
+  updatedAt: schema
+    .integer({ mode: 'timestamp' })
+    .notNull()
+    .default(sql`(unixepoch())`),
 }))

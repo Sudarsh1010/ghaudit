@@ -8,10 +8,7 @@ import {
 } from 'alchemy/cloudflare'
 
 const app = await alchemy('ghaudit', {
-  stateStore:
-    process.env.NODE_ENV === 'production'
-      ? (scope) => new CloudflareStateStore(scope)
-      : undefined,
+  stateStore: (scope) => new CloudflareStateStore(scope),
 })
 
 const ai = Ai()
@@ -27,8 +24,10 @@ export const worker = await TanStackStart('worker', {
   bindings: {
     AI: ai,
     D1: d1,
-    AUDIT_DO: DurableObjectNamespace('AUDIT_DO', {
-      className: 'AuditDO',
+    // GROQ_API_KEY must be provided as a secret/env var. Required.
+    GROQ_API_KEY: alchemy.secret(process.env.GROQ_API_KEY),
+    RESEARCH_DO: DurableObjectNamespace('RESEARCH_DO', {
+      className: 'ResearchDO',
       sqlite: true,
     }),
   },
