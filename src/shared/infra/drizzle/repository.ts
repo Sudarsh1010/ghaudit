@@ -14,7 +14,7 @@
  * down.
  */
 import { drizzle } from 'drizzle-orm/d1'
-import { and, asc, eq } from 'drizzle-orm'
+import { and, asc, eq, gt } from 'drizzle-orm'
 import { Context, Effect, Layer, ParseResult, Ref, Schema } from 'effect'
 import {
   type RepositoryError,
@@ -28,6 +28,7 @@ import {
   researchSessions,
   researchSteps,
   ResearchSessionStatus,
+  ResearchStepStatus,
 } from './schema'
 import {
   type Answer,
@@ -36,8 +37,8 @@ import {
   ResearchQuestion,
   ResearchSessionRow,
   type SessionStatus,
-  StepStatusSchema,
 } from './schemas'
+import { AgentEvent } from '~/shared/sse/events'
 
 /* ------------------------------------------------------------------ *
  * Domain inputs (writes)
@@ -51,14 +52,15 @@ export interface NewSession {
   readonly updatedAt: Date
 }
 
+/**
+ * One persisted Research Step = one emitted `AgentEvent`. The repo
+ * derives the legacy debug columns (`toolName`, `llmResponse`, etc.)
+ * from `event` so they stay populated for ad-hoc SQL, but only the
+ * `event` column is read back on the SSE replay path.
+ */
 export interface NewStep {
   readonly sessionId: string
-  readonly stepNumber: number
-  readonly toolName: string | null
-  readonly llmResponse: string | null
-  readonly toolRequest: string | null
-  readonly toolResponse: string | null
-  readonly status: Schema.Schema.Type<typeof StepStatusSchema>
+  readonly event: AgentEvent
 }
 
 export interface NewQuestion {
@@ -94,6 +96,10 @@ export class ResearchRepository extends Context.Tag('ResearchRepository')<
       id: string,
     ) => Effect.Effect<ResearchSessionRow, RepositoryError>
     readonly appendStep: (input: NewStep) => Effect.Effect<void, RepositoryError>
+    readonly getStepsAfter: (
+      sessionId: string,
+      lastEventId: number,
+    ) => Effect.Effect<ReadonlyArray<AgentEvent>, RepositoryError>
     readonly recordQuestion: (
       input: NewQuestion,
     ) => Effect.Effect<void, RepositoryError>
@@ -136,6 +142,66 @@ const decodeRow =
     )
 
 const encodeAnswer = Schema.encodeSync(AnswerJson)
+
+/**
+ * Project an `AgentEvent` into the row-shape `research_steps` expects.
+ * Centralised here so the D1 and in-memory adapters can't drift on the
+ * derived columns. The encoded `event` JSON is the source of truth.
+ */
+const encodeAgentEvent = Schema.encodeSync(AgentEvent)
+const decodeAgentEventUnknown = Schema.decodeUnknown(AgentEvent)
+const decodeStepEvent = (raw: unknown): Effect.Effect<AgentEvent, RepositoryRowDecodeError> =>
+  decodeAgentEventUnknown(raw).pipe(
+    Effect.mapError(
+      (cause: ParseResult.ParseError) =>
+        new RepositoryRowDecodeError({ entity: 'ResearchStep.event', cause }),
+    ),
+  )
+
+interface StepRowFields {
+  readonly sessionId: string
+  readonly stepNumber: number
+  readonly toolName: string | null
+  readonly llmResponse: string | null
+  readonly toolRequest: string | null
+  readonly toolResponse: string | null
+  readonly status: ResearchStepStatus
+  readonly event: string
+}
+
+const projectStep = (input: NewStep): StepRowFields => {
+  const { event } = input
+  const encoded = JSON.stringify(encodeAgentEvent(event))
+  return {
+    sessionId: input.sessionId,
+    stepNumber: event.id,
+    toolName: 'toolName' in event ? event.toolName : null,
+    toolRequest:
+      event.type === 'tool_invoked' ? JSON.stringify(event.args) : null,
+    toolResponse:
+      event.type === 'tool_result' ? JSON.stringify(event.result) : null,
+    llmResponse:
+      event.type === 'agent_thinking'
+        ? event.text
+        : event.type === 'done'
+          ? event.finalText
+          : null,
+    status: ResearchStepStatus.success,
+    event: encoded,
+  }
+}
+
+const parseEventColumn = (
+  raw: string,
+): Effect.Effect<AgentEvent, RepositoryRowDecodeError> =>
+  Effect.try({
+    try: () => JSON.parse(raw) as unknown,
+    catch: (cause) =>
+      new RepositoryRowDecodeError({
+        entity: 'ResearchStep.event',
+        cause: cause as ParseResult.ParseError,
+      }),
+  }).pipe(Effect.flatMap(decodeStepEvent))
 
 /* ------------------------------------------------------------------ *
  * D1 / Drizzle adapter
@@ -190,15 +256,25 @@ const makeD1 = (env: { D1: D1Database }) => {
 
     appendStep: (input) =>
       tryDb(async () => {
-        await db.insert(researchSteps).values({
-          sessionId: input.sessionId,
-          stepNumber: input.stepNumber,
-          toolName: input.toolName,
-          toolRequest: input.toolRequest,
-          toolResponse: input.toolResponse,
-          llmResponse: input.llmResponse,
-          status: input.status,
-        })
+        const row = projectStep(input)
+        await db.insert(researchSteps).values(row)
+      }),
+
+    getStepsAfter: (sessionId, lastEventId) =>
+      Effect.gen(function* () {
+        const rows = yield* tryDb(() =>
+          db
+            .select({ event: researchSteps.event })
+            .from(researchSteps)
+            .where(
+              and(
+                eq(researchSteps.sessionId, sessionId),
+                gt(researchSteps.stepNumber, lastEventId),
+              ),
+            )
+            .orderBy(asc(researchSteps.stepNumber)),
+        )
+        return yield* Effect.forEach(rows, (r) => parseEventColumn(r.event))
       }),
 
     recordQuestion: (input) =>
@@ -315,9 +391,7 @@ export const RepositoryInMemoryLive: Layer.Layer<ResearchRepository> =
       const sessions = yield* Ref.make(
         new Map<string, ResearchSessionRow>(),
       )
-      const steps = yield* Ref.make<
-        Array<{ sessionId: string; stepNumber: number; toolName: string | null }>
-      >([])
+      const steps = yield* Ref.make<Array<StepRowFields>>([])
       const questions = yield* Ref.make(new Map<string, RawQuestionRow>())
       const prdSeq = yield* Ref.make(0)
       const prdRows = yield* Ref.make<Array<RawPrdSectionRow>>([])
@@ -368,14 +442,20 @@ export const RepositoryInMemoryLive: Layer.Layer<ResearchRepository> =
           }),
 
         appendStep: (input) =>
-          Ref.update(steps, (arr) => [
-            ...arr,
-            {
-              sessionId: input.sessionId,
-              stepNumber: input.stepNumber,
-              toolName: input.toolName,
-            },
-          ]),
+          Ref.update(steps, (arr) => [...arr, projectStep(input)]),
+
+        getStepsAfter: (sessionId, lastEventId) =>
+          Effect.gen(function* () {
+            const arr = yield* Ref.get(steps)
+            const filtered = arr
+              .filter(
+                (r) => r.sessionId === sessionId && r.stepNumber > lastEventId,
+              )
+              .sort((a, b) => a.stepNumber - b.stepNumber)
+            return yield* Effect.forEach(filtered, (r) =>
+              parseEventColumn(r.event),
+            )
+          }),
 
         recordQuestion: (input) =>
           Ref.update(questions, (m) => {

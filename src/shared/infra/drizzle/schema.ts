@@ -66,6 +66,13 @@ export const researchSteps = sqliteTable('research_steps', (schema) => ({
   toolRequest: schema.text(),
   toolResponse: schema.text(),
   errorMessage: schema.text(),
+  /**
+   * Source-of-truth for SSE replay (Slice 5): the full encoded
+   * `AgentEvent` (id + type + payload) as JSON. The other columns above
+   * are kept for legibility and ad-hoc SQL — they're derived from this
+   * one and not read by the app.
+   */
+  event: schema.text().notNull(),
   status: schema
     .text({
       mode: 'text',
