@@ -18,12 +18,13 @@ See [`CONTEXT.md`](./CONTEXT.md) for the domain language.
 
 ## Required secrets
 
-| Name           | Purpose                                                              |
-| -------------- | -------------------------------------------------------------------- |
-| `GROQ_API_KEY` | API key for Groq Cloud. Used by `src/shared/infra/groq/client.ts`.   |
+| Name                    | Purpose                                                                                            |
+| ----------------------- | -------------------------------------------------------------------------------------------------- |
+| `GROQ_API_KEY`          | API key for Groq Cloud. Used by `src/shared/infra/groq/client.ts`.                                 |
+| `SESSION_COOKIE_SECRET` | HMAC key for signing the `session_owner` cookie (Slice 6). Rotating it invalidates every cookie.  |
 
-For local dev, put it in `.env` at the project root. For deploys, configure it
-through Alchemy / Cloudflare secrets.
+For local dev, put them in `.env` at the project root. For deploys, configure
+them through Alchemy / Cloudflare secrets.
 
 ## Common scripts
 

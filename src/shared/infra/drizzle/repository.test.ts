@@ -59,6 +59,7 @@ const seedSession = (id: string) =>
       id,
       initialPrompt: `prompt-${id}`,
       status: ResearchSessionStatus.active,
+      ownerId: `own_${id}`,
       createdAt: now,
       updatedAt: now,
     })

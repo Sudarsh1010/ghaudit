@@ -69,6 +69,7 @@ const seed = Effect.gen(function* () {
     id: 's1',
     initialPrompt: 'design a CLI dark mode toggler',
     status: ResearchSessionStatus.active,
+    ownerId: 'own_s1',
     createdAt: new Date(millis),
     updatedAt: new Date(millis),
   })

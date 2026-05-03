@@ -22,10 +22,12 @@
  * request, then renders to a `Response` via `Effect.runPromise`.
  */
 import handler from '@tanstack/react-start/server-entry'
-import { Cause, Effect } from 'effect'
+import { Cause, Effect, Layer } from 'effect'
+import { assertSessionAccess } from '~/shared/auth/access'
+import { OwnerCookie, OwnerCookieLive } from '~/shared/auth/cookie'
+import { readSessionOwnerCookie } from '~/shared/auth/header'
 import {
   type AppError,
-  NotFound,
   statusForError,
 } from '~/shared/domain/errors'
 import { ResearchRepository } from '~/shared/infra/drizzle/repository'
@@ -46,16 +48,17 @@ const handleStream = (
   sessionId: string,
   request: Request,
   env: Env,
-): Effect.Effect<Response, AppError, ResearchRepository> =>
+): Effect.Effect<Response, AppError, ResearchRepository | OwnerCookie> =>
   Effect.gen(function* () {
-    const repo = yield* ResearchRepository
-    const session = yield* repo.getSessionById(sessionId).pipe(
-      Effect.catchTag('RepositoryNotFound', () =>
-        Effect.fail(new NotFound({ resource: `session ${sessionId}` })),
-      ),
-    )
-    // The browser's EventSource sets `Last-Event-ID` automatically on
-    // reconnect. Coerce non-numeric values to 0 so a missing or
+    // Slice 6: cookie ownership is checked at this seam (the DO has no
+    // notion of cookies). `assertSessionAccess` returns the row so we
+    // don't pay a second `getSessionById` round-trip below.
+    const session = yield* assertSessionAccess({
+      sessionId,
+      signedCookie: readSessionOwnerCookie(request.headers.get('cookie')),
+    })
+    // Slice 5: the browser's EventSource sets `Last-Event-ID` automatically
+    // on reconnect. Coerce non-numeric values to 0 so a missing or
     // malformed header behaves like "start from scratch".
     const headerValue = request.headers.get('last-event-id')
     const parsed = headerValue !== null ? Number(headerValue) : NaN
@@ -74,11 +77,18 @@ const handleStream = (
 
 const handlePrd = (
   sessionId: string,
+  request: Request,
   env: Env,
-): Effect.Effect<Response> =>
-  Effect.promise(() =>
-    doStub(env, sessionId).fetch('https://do/prd', { method: 'GET' }),
-  )
+): Effect.Effect<Response, AppError, ResearchRepository | OwnerCookie> =>
+  Effect.gen(function* () {
+    yield* assertSessionAccess({
+      sessionId,
+      signedCookie: readSessionOwnerCookie(request.headers.get('cookie')),
+    })
+    return yield* Effect.promise(() =>
+      doStub(env, sessionId).fetch('https://do/prd', { method: 'GET' }),
+    )
+  })
 
 /* ------------------------------------------------------------------ *
  * DO stub helper
@@ -108,13 +118,29 @@ const doStub = (
 
 const runRequest = (
   env: Env,
-  program: Effect.Effect<Response, AppError, ResearchRepository>,
+  program: Effect.Effect<Response, AppError, ResearchRepository | OwnerCookie>,
 ): Promise<Response> => {
-  const e = env as unknown as { D1: D1Database; GROQ_API_KEY?: string }
+  const e = env as unknown as {
+    D1: D1Database
+    GROQ_API_KEY?: string
+    SESSION_COOKIE_SECRET?: string
+  }
+  if (!e.SESSION_COOKIE_SECRET || e.SESSION_COOKIE_SECRET.length === 0) {
+    // Fail closed: a missing secret would let cookie verification
+    // succeed against an empty key, which is a worse failure mode than
+    // a 500 at the session-scoped boundary.
+    return Promise.resolve(
+      new Response('SESSION_COOKIE_SECRET is not set', { status: 500 }),
+    )
+  }
+  const layer = Layer.merge(
+    MainLive({ D1: e.D1, groq: { apiKey: e.GROQ_API_KEY } }),
+    OwnerCookieLive(e.SESSION_COOKIE_SECRET),
+  )
   return Effect.runPromise(
     program.pipe(
       Effect.catchAll((err: AppError) => Effect.succeed(toErrorResponse(err))),
-      Effect.provide(MainLive({ D1: e.D1, groq: { apiKey: e.GROQ_API_KEY } })),
+      Effect.provide(layer),
       Effect.catchAllCause((cause) =>
         Effect.succeed(
           new Response(`internal error: ${Cause.pretty(cause)}`, {
@@ -150,7 +176,7 @@ export default {
 
     const prdMatch = url.pathname.match(PRD_PATH)
     if (prdMatch && request.method === 'GET') {
-      return runRequest(env, handlePrd(prdMatch[1]!, env))
+      return runRequest(env, handlePrd(prdMatch[1]!, request, env))
     }
 
     return handler.fetch(request, {

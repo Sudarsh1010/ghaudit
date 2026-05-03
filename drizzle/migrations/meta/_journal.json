@@ -22,6 +22,13 @@
       "when": 1777779807852,
       "tag": "0002_research_steps_event_column",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1777814796229,
+      "tag": "0003_research_sessions_owner_id",
+      "breakpoints": true
     }
   ]
 }

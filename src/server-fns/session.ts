@@ -23,10 +23,20 @@
  * server-function context doesn't expose env directly.
  */
 import { createServerFn } from '@tanstack/react-start'
-import { getRequest } from '@tanstack/react-start/server'
+import {
+  getRequest,
+  getRequestHeader,
+  setResponseHeader,
+} from '@tanstack/react-start/server'
 // eslint-disable-next-line import/no-unresolved
 import { env } from 'cloudflare:workers'
-import { Cause, Effect, Layer, Schema } from 'effect'
+import { Cause, Effect, Layer, Option, Schema } from 'effect'
+import { assertSessionAccess } from '~/shared/auth/access'
+import { OwnerCookie, OwnerCookieLive } from '~/shared/auth/cookie'
+import {
+  buildSessionOwnerCookie,
+  readSessionOwnerCookie,
+} from '~/shared/auth/header'
 import { type AppError, statusForError } from '~/shared/domain/errors'
 import { createSession } from '~/shared/research/session'
 import {
@@ -74,6 +84,51 @@ const renderCause = (cause: Cause.Cause<unknown>): ServerFnError => {
 }
 
 /* ------------------------------------------------------------------ *
+ * Runtime boundary
+ *
+ * Every server-fn handler ends with the same triplet: provide the
+ * Effect layer, render `AppError`s to throwable `ServerFnError`s, fold
+ * unexpected defects into 500s. `runServerFn` is that triplet so each
+ * handler reads as the program it actually is, not the boilerplate
+ * around it.
+ *
+ * The base layer (MainLive + OwnerCookieLive) is also shared — both
+ * RPC endpoints need DB + cookie verification. `createSessionFn` adds
+ * the per-request `EventStreamUrlBuilderLive` on top.
+ *
+ * `requireCookieSecret` reads the env at call-time (not at module load)
+ * so a missing secret surfaces as an `Error` thrown from the server-fn
+ * boundary the user actually hit, rather than a worker-bootstrap
+ * exception buried in platform logs.
+ * ------------------------------------------------------------------ */
+
+const requireCookieSecret = (): string => {
+  const e = env as unknown as { SESSION_COOKIE_SECRET?: string }
+  if (!e.SESSION_COOKIE_SECRET || e.SESSION_COOKIE_SECRET.length === 0) {
+    throw new Error('SESSION_COOKIE_SECRET is not set')
+  }
+  return e.SESSION_COOKIE_SECRET
+}
+
+const baseSessionLayer = () =>
+  Layer.merge(
+    MainLive({ D1: env.D1, groq: { apiKey: env.GROQ_API_KEY } }),
+    OwnerCookieLive(requireCookieSecret()),
+  )
+
+const runServerFn = <A, R>(
+  layer: Layer.Layer<R, AppError>,
+  program: Effect.Effect<A, AppError, R>,
+): Promise<A> =>
+  Effect.runPromise(
+    program.pipe(
+      Effect.provide(layer),
+      Effect.catchAll((err: AppError) => Effect.fail(renderError(err))),
+      Effect.catchAllCause((cause) => Effect.fail(renderCause(cause))),
+    ),
+  )
+
+/* ------------------------------------------------------------------ *
  * createSessionFn
  *
  * Mints a Research Session, returns the SSE URL the client should
@@ -81,23 +136,46 @@ const renderCause = (cause: Cause.Cause<unknown>): ServerFnError => {
  * request's origin so the same code works in dev and prod.
  * ------------------------------------------------------------------ */
 
+interface CreateSessionResponse {
+  readonly sessionId: string
+  readonly eventStreamUrl: string
+}
+
 export const createSessionFn = createServerFn({ method: 'POST' })
   .inputValidator(Schema.decodeUnknownSync(CreateSessionInput))
-  .handler(async ({ data }) => {
+  .handler(async ({ data }): Promise<CreateSessionResponse> => {
     const url = new URL(getRequest().url)
     const layer = Layer.merge(
-      MainLive({ D1: env.D1, groq: { apiKey: env.GROQ_API_KEY } }),
+      baseSessionLayer(),
       EventStreamUrlBuilderLive(
         (id) => `${url.origin}/session/${id}/stream`,
       ),
     )
-    return Effect.runPromise(
-      createSession(data).pipe(
-        Effect.provide(layer),
-        Effect.catchAll((err: AppError) => Effect.fail(renderError(err))),
-        Effect.catchAllCause((cause) => Effect.fail(renderCause(cause))),
-      ),
+    const { created, signed } = await runServerFn(
+      layer,
+      Effect.gen(function* () {
+        const created = yield* createSession(data)
+        const cookie = yield* OwnerCookie
+        const signed = yield* cookie.sign(created.ownerId)
+        return { created, signed }
+      }),
     )
+
+    setResponseHeader(
+      'Set-Cookie',
+      buildSessionOwnerCookie({
+        sessionId: created.sessionId,
+        signedValue: signed,
+      }),
+    )
+
+    // Don't expose the owner id to the browser. The cookie carries the
+    // signed copy already; client code only needs the session id and
+    // SSE URL.
+    return {
+      sessionId: created.sessionId,
+      eventStreamUrl: created.eventStreamUrl,
+    }
   })
 
 /* ------------------------------------------------------------------ *
@@ -141,6 +219,18 @@ interface ResearchDONamespace {
 export const submitAnswerFn = createServerFn({ method: 'POST' })
   .inputValidator(Schema.decodeUnknownSync(SubmitAnswerInput))
   .handler(async ({ data }): Promise<AnswerSuccessBody> => {
+    // Cookie check happens *before* we call into the DO. The DO has no
+    // notion of cookies; ownership is enforced at the worker / server-fn
+    // boundary against the row's owner_id.
+    const signedCookie = readSessionOwnerCookie(getRequestHeader('cookie'))
+    await runServerFn(
+      baseSessionLayer(),
+      assertSessionAccess({
+        sessionId: data.sessionId,
+        signedCookie: signedCookie as Option.Option<string>,
+      }),
+    )
+
     const ns = env.RESEARCH_DO as unknown as ResearchDONamespace
     const stub = ns.get(ns.idFromName(data.sessionId))
     const res = await stub.fetch('https://do/answer', {

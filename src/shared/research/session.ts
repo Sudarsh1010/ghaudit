@@ -26,6 +26,15 @@ export interface CreateSessionInput {
 export interface CreateSessionOutput {
   readonly sessionId: string
   readonly eventStreamUrl: string
+  /**
+   * Opaque owner identifier for the cookie holder. The caller is
+   * responsible for HMAC-signing it before placing it in the
+   * `session_owner` cookie (see `src/shared/auth/cookie.ts`). The id
+   * itself is persisted as the session's `owner_id`; verification on
+   * subsequent requests recomputes the signature and compares the
+   * decoded id to the stored value.
+   */
+  readonly ownerId: string
 }
 
 /**
@@ -53,6 +62,7 @@ export const createSession = (
     const urlBuilder = yield* EventStreamUrlBuilder
 
     const id = yield* ids.mint('rs_')
+    const ownerId = yield* ids.mint('own_')
     const millis = yield* Clock.currentTimeMillis
     const now = new Date(millis)
 
@@ -60,6 +70,7 @@ export const createSession = (
       id,
       initialPrompt: input.initialPrompt,
       status: ResearchSessionStatus.active,
+      ownerId,
       createdAt: now,
       updatedAt: now,
     })
@@ -67,5 +78,6 @@ export const createSession = (
     return {
       sessionId: id,
       eventStreamUrl: urlBuilder.build(id),
+      ownerId,
     }
   })

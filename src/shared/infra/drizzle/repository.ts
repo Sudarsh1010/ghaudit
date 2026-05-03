@@ -48,6 +48,7 @@ export interface NewSession {
   readonly id: string
   readonly initialPrompt: string
   readonly status: SessionStatus
+  readonly ownerId: string
   readonly createdAt: Date
   readonly updatedAt: Date
 }
@@ -225,6 +226,7 @@ const makeD1 = (env: { D1: D1Database }) => {
           id: input.id,
           initialPrompt: input.initialPrompt,
           status: input.status,
+          ownerId: input.ownerId,
           createdAt: input.createdAt,
           updatedAt: input.updatedAt,
         })
@@ -407,6 +409,7 @@ export const RepositoryInMemoryLive: Layer.Layer<ResearchRepository> =
               id: input.id,
               initialPrompt: input.initialPrompt,
               status: input.status,
+              ownerId: input.ownerId,
               createdAt: input.createdAt,
               updatedAt: input.updatedAt,
             })

@@ -66,6 +66,7 @@ const seedSession = (
       id,
       initialPrompt: `prompt-${id}`,
       status,
+      ownerId: `own_${id}`,
       createdAt: now,
       updatedAt: now,
     })

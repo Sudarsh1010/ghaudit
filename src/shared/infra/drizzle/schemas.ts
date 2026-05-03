@@ -63,6 +63,7 @@ export const ResearchSessionRow = Schema.Struct({
   id: Schema.String,
   initialPrompt: Schema.String,
   status: SessionStatusSchema,
+  ownerId: Schema.String,
   createdAt: Schema.ValidDateFromSelf,
   updatedAt: Schema.ValidDateFromSelf,
 })

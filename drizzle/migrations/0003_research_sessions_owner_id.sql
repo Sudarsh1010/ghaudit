@@ -1,0 +1,1 @@
+ALTER TABLE `research_sessions` ADD `owner_id` text(40) NOT NULL;
