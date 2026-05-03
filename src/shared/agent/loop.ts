@@ -58,7 +58,12 @@ const SYSTEM = (softCap: number): string =>
   `You are a Research agent grilling the user about a feature so you can produce a PRD.\n` +
   `Aim to finish in under ${softCap} tool calls. Always pair an askQuestion with a recommendation and rationale. ` +
   `When you have enough material, write PRD sections via writeOutput({ kind: 'prd_section', section, content }) ` +
-  `and then call finalize({ summary }).`
+  `and then call finalize({ summary }).\n\n` +
+  `Before recommending an answer to a non-trivial question, ground yourself with the research tools:\n` +
+  `  - webSearch({ query }) — Brave web search; use for sources, recent posts, comparisons.\n` +
+  `  - searchLibraryDocs({ library, query }) — Context7 docs lookup; use whenever the decision turns on a specific library or framework.\n` +
+  `  - readUrl({ url }) — fetch the readable text of a URL returned by webSearch when the snippet alone is insufficient.\n` +
+  `Prefer one or two targeted research calls per decision over guessing; cite the result back to the user in your rationale.`
 
 export const runLoop = <R, E>(
   input: RunLoopInput,

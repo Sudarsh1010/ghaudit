@@ -91,6 +91,90 @@ export type GroqError =
   | GroqEmptyCompletionError
 
 /* ------------------------------------------------------------------ *
+ * Brave Search
+ * ------------------------------------------------------------------ */
+
+export class BraveAuthError extends Data.TaggedError('BraveAuthError')<{
+  readonly reason: string
+}> {}
+
+export class BraveNetworkError extends Data.TaggedError('BraveNetworkError')<{
+  readonly cause: unknown
+}> {}
+
+export class BraveRateLimitError extends Data.TaggedError(
+  'BraveRateLimitError',
+)<{
+  readonly retryAfterSeconds?: number
+}> {}
+
+export class BraveApiError extends Data.TaggedError('BraveApiError')<{
+  readonly status: number
+  readonly body: string
+}> {}
+
+export type BraveError =
+  | BraveAuthError
+  | BraveNetworkError
+  | BraveRateLimitError
+  | BraveApiError
+
+/* ------------------------------------------------------------------ *
+ * Context7
+ * ------------------------------------------------------------------ */
+
+export class Context7NetworkError extends Data.TaggedError(
+  'Context7NetworkError',
+)<{
+  readonly cause: unknown
+}> {}
+
+export class Context7ApiError extends Data.TaggedError('Context7ApiError')<{
+  readonly status: number
+  readonly body: string
+}> {}
+
+export class Context7NotFound extends Data.TaggedError('Context7NotFound')<{
+  readonly query: string
+}> {}
+
+export type Context7Error =
+  | Context7NetworkError
+  | Context7ApiError
+  | Context7NotFound
+
+/* ------------------------------------------------------------------ *
+ * URL fetcher (readUrl)
+ * ------------------------------------------------------------------ */
+
+export class UrlFetcherTimeout extends Data.TaggedError('UrlFetcherTimeout')<{
+  readonly url: string
+}> {}
+
+export class UrlFetcherTooLarge extends Data.TaggedError('UrlFetcherTooLarge')<{
+  readonly url: string
+  readonly bytes: number
+}> {}
+
+export class UrlFetcherHttpError extends Data.TaggedError('UrlFetcherHttpError')<{
+  readonly url: string
+  readonly status: number
+}> {}
+
+export class UrlFetcherNetworkError extends Data.TaggedError(
+  'UrlFetcherNetworkError',
+)<{
+  readonly url: string
+  readonly cause: unknown
+}> {}
+
+export type UrlFetcherError =
+  | UrlFetcherTimeout
+  | UrlFetcherTooLarge
+  | UrlFetcherHttpError
+  | UrlFetcherNetworkError
+
+/* ------------------------------------------------------------------ *
  * Tools
  * ------------------------------------------------------------------ */
 
@@ -175,7 +259,13 @@ export type RequestParseError = JsonSyntaxError | SchemaViolation
  * Agent Loop — union of everything the loop can fail with.
  * ------------------------------------------------------------------ */
 
-export type LoopError = GroqError | ToolError | RepositoryError
+export type LoopError =
+  | GroqError
+  | ToolError
+  | RepositoryError
+  | BraveError
+  | Context7Error
+  | UrlFetcherError
 
 /* ------------------------------------------------------------------ *
  * HTTP status mapping
@@ -193,6 +283,9 @@ export type AppError =
   | NotFound
   | Conflict
   | Forbidden
+  | BraveError
+  | Context7Error
+  | UrlFetcherError
 
 export const statusForError = (e: AppError): number => {
   switch (e._tag) {
@@ -214,12 +307,26 @@ export const statusForError = (e: AppError): number => {
     case 'GroqAuthError':
       return 502
     case 'GroqRateLimitError':
+    case 'BraveRateLimitError':
       return 429
     case 'GroqNetworkError':
     case 'GroqApiError':
     case 'GroqParseError':
     case 'GroqEmptyCompletionError':
+    case 'BraveAuthError':
+    case 'BraveNetworkError':
+    case 'BraveApiError':
+    case 'Context7NetworkError':
+    case 'Context7ApiError':
+    case 'UrlFetcherNetworkError':
+    case 'UrlFetcherHttpError':
       return 502
+    case 'Context7NotFound':
+      return 404
+    case 'UrlFetcherTimeout':
+      return 504
+    case 'UrlFetcherTooLarge':
+      return 413
     case 'ToolExecutionError':
     case 'RepositoryRowDecodeError':
     case 'RepositoryUnknownError':
