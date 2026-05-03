@@ -11,37 +11,30 @@
  *      │       │                ▼
  *      │       │          ABANDONED
  *
- * The machine is pure: no IO, no side effects. Hosts (the DO) call
- * `transition(state, event)` and persist the resulting state separately.
+ * Pure: no IO, no side effects. `transition(state, event)` returns an
+ * Effect so callers cannot silently drop invalid transitions — failure
+ * to handle the `StateTransitionError` is a type error.
  */
+import { Effect, Schema } from 'effect'
+import { StateTransitionError } from '~/shared/domain/errors'
 
-export type SessionState =
-  | 'RUNNING'
-  | 'WAITING_FOR_USER'
-  | 'COMPLETED'
-  | 'FAILED'
-  | 'ABANDONED'
+export const SessionState = Schema.Literal(
+  'RUNNING',
+  'WAITING_FOR_USER',
+  'COMPLETED',
+  'FAILED',
+  'ABANDONED',
+)
+export type SessionState = Schema.Schema.Type<typeof SessionState>
 
-export type SessionEvent =
-  | 'askQuestion'
-  | 'answer'
-  | 'finalize'
-  | 'fail'
-  | 'abandon'
-
-export class StateTransitionError extends Error {
-  constructor(
-    public readonly from: SessionState,
-    public readonly event: SessionEvent,
-  ) {
-    super(`Invalid transition: ${from} + ${event}`)
-    this.name = 'StateTransitionError'
-  }
-}
-
-export type TransitionResult =
-  | { ok: true; state: SessionState }
-  | { ok: false; error: StateTransitionError }
+export const SessionEvent = Schema.Literal(
+  'askQuestion',
+  'answer',
+  'finalize',
+  'fail',
+  'abandon',
+)
+export type SessionEvent = Schema.Schema.Type<typeof SessionEvent>
 
 const TABLE: Record<SessionState, Partial<Record<SessionEvent, SessionState>>> =
   {
@@ -60,13 +53,18 @@ const TABLE: Record<SessionState, Partial<Record<SessionEvent, SessionState>>> =
     ABANDONED: {},
   }
 
+/**
+ * Compute the next state. Fails with `StateTransitionError` when the
+ * (state, event) pair has no edge in the table.
+ */
 export const transition = (
   state: SessionState,
   event: SessionEvent,
-): TransitionResult => {
+): Effect.Effect<SessionState, StateTransitionError> => {
   const next = TABLE[state][event]
-  if (!next) {
-    return { ok: false, error: new StateTransitionError(state, event) }
-  }
-  return { ok: true, state: next }
+  return next === undefined
+    ? Effect.fail(new StateTransitionError({ from: state, event }))
+    : Effect.succeed(next)
 }
+
+export { StateTransitionError }

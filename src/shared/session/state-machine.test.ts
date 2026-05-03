@@ -1,4 +1,10 @@
-import { describe, it, expect } from 'vitest'
+/**
+ * Pure FSM — no IO, no R, no layers. We assert through `Effect.exit` so
+ * the success/failure shape is the test surface, not a hand-rolled
+ * `{ok, state}` envelope.
+ */
+import { describe, it, expect } from '@effect/vitest'
+import { Cause, Effect, Exit } from 'effect'
 import {
   transition,
   StateTransitionError,
@@ -10,44 +16,49 @@ const expectOk = (
   from: SessionState,
   event: SessionEvent,
   to: SessionState,
-) => {
-  const result = transition(from, event)
-  expect(result).toEqual({ ok: true, state: to })
-}
-
-const expectErr = (from: SessionState, event: SessionEvent) => {
-  const result = transition(from, event)
-  expect(result).toMatchObject({ ok: false })
-  expect((result as { error: StateTransitionError }).error).toBeInstanceOf(
-    StateTransitionError,
+) =>
+  it.effect(`${from} + ${event} → ${to}`, () =>
+    Effect.gen(function* () {
+      const next = yield* transition(from, event)
+      expect(next).toBe(to)
+    }),
   )
-}
+
+const expectErr = (from: SessionState, event: SessionEvent) =>
+  it.effect(`${from} + ${event} → StateTransitionError`, () =>
+    Effect.gen(function* () {
+      const exit = yield* Effect.exit(transition(from, event))
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        const failure = Cause.failureOption(exit.cause)
+        expect(failure._tag).toBe('Some')
+        if (failure._tag === 'Some') {
+          expect(failure.value).toBeInstanceOf(StateTransitionError)
+          expect(failure.value._tag).toBe('StateTransitionError')
+          expect(failure.value.from).toBe(from)
+          expect(failure.value.event).toBe(event)
+        }
+      }
+    }),
+  )
 
 describe('session state machine', () => {
   describe('valid transitions', () => {
-    it('RUNNING + askQuestion → WAITING_FOR_USER', () => {
-      expectOk('RUNNING', 'askQuestion', 'WAITING_FOR_USER')
-    })
-    it('RUNNING + finalize → COMPLETED', () => {
-      expectOk('RUNNING', 'finalize', 'COMPLETED')
-    })
-    it('RUNNING + fail → FAILED', () => {
-      expectOk('RUNNING', 'fail', 'FAILED')
-    })
-    it('RUNNING + abandon → ABANDONED', () => {
-      expectOk('RUNNING', 'abandon', 'ABANDONED')
-    })
-    it('WAITING_FOR_USER + answer → RUNNING', () => {
-      expectOk('WAITING_FOR_USER', 'answer', 'RUNNING')
-    })
-    it('WAITING_FOR_USER + abandon → ABANDONED', () => {
-      expectOk('WAITING_FOR_USER', 'abandon', 'ABANDONED')
-    })
+    expectOk('RUNNING', 'askQuestion', 'WAITING_FOR_USER')
+    expectOk('RUNNING', 'finalize', 'COMPLETED')
+    expectOk('RUNNING', 'fail', 'FAILED')
+    expectOk('RUNNING', 'abandon', 'ABANDONED')
+    expectOk('WAITING_FOR_USER', 'answer', 'RUNNING')
+    expectOk('WAITING_FOR_USER', 'abandon', 'ABANDONED')
   })
 
   describe('invalid transitions', () => {
-    const terminal: Array<SessionState> = ['COMPLETED', 'FAILED', 'ABANDONED']
-    const allEvents: Array<SessionEvent> = [
+    const terminal: ReadonlyArray<SessionState> = [
+      'COMPLETED',
+      'FAILED',
+      'ABANDONED',
+    ]
+    const allEvents: ReadonlyArray<SessionEvent> = [
       'askQuestion',
       'answer',
       'finalize',
@@ -57,20 +68,12 @@ describe('session state machine', () => {
 
     for (const state of terminal) {
       for (const event of allEvents) {
-        it(`${state} + ${event} → error`, () => {
-          expectErr(state, event)
-        })
+        expectErr(state, event)
       }
     }
 
-    it('RUNNING + answer → error', () => {
-      expectErr('RUNNING', 'answer')
-    })
-    it('WAITING_FOR_USER + askQuestion → error (already waiting)', () => {
-      expectErr('WAITING_FOR_USER', 'askQuestion')
-    })
-    it('WAITING_FOR_USER + finalize → error', () => {
-      expectErr('WAITING_FOR_USER', 'finalize')
-    })
+    expectErr('RUNNING', 'answer')
+    expectErr('WAITING_FOR_USER', 'askQuestion')
+    expectErr('WAITING_FOR_USER', 'finalize')
   })
 })

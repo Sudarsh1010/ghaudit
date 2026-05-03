@@ -1,31 +1,45 @@
-import { describe, it, expect, vi } from 'vitest'
-import { createSession } from './session'
-
 /**
- * Slice 2 happy-path: simulates what the worker entry does for `POST /session`
- * by wiring `createSession` to an in-memory "table" and a fake URL builder.
- * The actual streaming is exercised by `streaming-agent.test.ts`.
+ * Slice 2 happy-path: simulates `POST /session` end-to-end at the use-case
+ * layer.
+ *
+ * Differs from `session.test.ts` in that it uses the **live** `Ids` layer
+ * (real web crypto) so we exercise the production id format. The session
+ * row goes through `RepositoryInMemoryLive` because we don't want a D1
+ * binding in the test.
  */
+import { describe, it, expect } from '@effect/vitest'
+import { Effect, Layer } from 'effect'
+import { IdsLive } from '~/shared/domain/ids'
+import {
+  RepositoryInMemoryLive,
+  ResearchRepository,
+} from '~/shared/infra/drizzle/repository'
+import { ResearchSessionStatus } from '~/shared/infra/drizzle/schema'
+import { createSession } from './session'
+import { EventStreamUrlBuilderLive } from '~/shared/runtime/main'
+
+const TestLayer = Layer.mergeAll(
+  IdsLive,
+  RepositoryInMemoryLive,
+  EventStreamUrlBuilderLive((id) => `/session/${id}/stream`),
+)
+
 describe('POST /session happy path (slice 2)', () => {
-  it('persists a session row and returns the eventStreamUrl', async () => {
-    const sessionsTable: Array<unknown> = []
-    const buildEventStreamUrl = vi.fn(
-      (id: string) => `/session/${id}/stream`,
-    )
+  it.effect('persists a session row and returns the eventStreamUrl', () =>
+    Effect.gen(function* () {
+      const result = yield* createSession({
+        initialPrompt: 'help me write a PRD',
+      })
 
-    const result = await createSession(
-      { initialPrompt: 'help me write a PRD' },
-      {
-        insertSession: async (row) => {
-          sessionsTable.push(row)
-        },
-        buildEventStreamUrl,
-      },
-    )
+      expect(result.sessionId).toMatch(/^rs_[0-9a-f]{16}$/)
+      expect(result.eventStreamUrl).toBe(
+        `/session/${result.sessionId}/stream`,
+      )
 
-    expect(result.sessionId).toMatch(/^rs_/)
-    expect(result.eventStreamUrl).toBe(`/session/${result.sessionId}/stream`)
-    expect(sessionsTable).toHaveLength(1)
-    expect(buildEventStreamUrl).toHaveBeenCalledOnce()
-  })
+      const repo = yield* ResearchRepository
+      const row = yield* repo.getSessionById(result.sessionId)
+      expect(row.initialPrompt).toBe('help me write a PRD')
+      expect(row.status).toBe(ResearchSessionStatus.active)
+    }).pipe(Effect.provide(TestLayer)),
+  )
 })

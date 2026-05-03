@@ -1,23 +1,42 @@
-export class GitHubError extends Error {
-  constructor(
-    message: string,
-    public readonly status?: number,
-  ) {
-    super(`[GitHubError] ${message}`)
-    this.name = 'GitHubError'
-  }
-}
+/**
+ * Tagged error taxonomy for the GitHub seam.
+ *
+ * Mirrors the rules used elsewhere (`src/shared/domain/errors.ts`):
+ * every adapter failure is one of a small union, and the union is what
+ * callers branch on — never a string match against `.message`.
+ */
+import { Data } from 'effect'
 
-export class GitHubRateLimitError extends GitHubError {
-  constructor(resetAt: Date) {
-    super(`Rate limited. Reset at ${resetAt.toISOString()}`, 403)
-    this.name = 'GitHubRateLimitError'
-  }
-}
+export class GitHubAuthError extends Data.TaggedError('GitHubAuthError')<{
+  readonly reason: string
+}> {}
 
-export class GitHubInsufficientPermissionsError extends GitHubError {
-  constructor(missingScope: string) {
-    super(`Missing required scope: ${missingScope}`, 403)
-    this.name = 'GitHubInsufficientPermissionsError'
-  }
-}
+export class GitHubRateLimitError extends Data.TaggedError(
+  'GitHubRateLimitError',
+)<{
+  readonly resetAt: Date
+}> {}
+
+export class GitHubInsufficientPermissionsError extends Data.TaggedError(
+  'GitHubInsufficientPermissionsError',
+)<{
+  readonly missingScope: string
+}> {}
+
+export class GitHubApiError extends Data.TaggedError('GitHubApiError')<{
+  readonly status: number
+  readonly body: string
+}> {}
+
+export class GitHubNetworkError extends Data.TaggedError(
+  'GitHubNetworkError',
+)<{
+  readonly cause: unknown
+}> {}
+
+export type GitHubError =
+  | GitHubAuthError
+  | GitHubRateLimitError
+  | GitHubInsufficientPermissionsError
+  | GitHubApiError
+  | GitHubNetworkError

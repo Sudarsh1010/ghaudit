@@ -1,167 +1,204 @@
-import { describe, it, expect, vi } from 'vitest'
-import { runLoop, type LoopHaltReason } from './loop'
-import type { GroqClient } from '~/shared/infra/groq/client'
+/**
+ * Agent Loop tests — `runLoop` is a `Stream<AgentEvent, …, R>`. Tests
+ * compose:
+ *
+ *   GroqStub.layer([turns…])    — canned LLM responses
+ *   RepositoryInMemoryLive       — Map-backed persistence
+ *   IdsTest                      — deterministic question ids
+ *   SessionContext fixed layer   — `sessionId: 's'`
+ *
+ * and assert on the emitted events via `Stream.runCollect`.
+ *
+ * Halt conditions covered:
+ *   - Pause   (askQuestion → question_asked, stream ends)
+ *   - Finalise (finalize  → done, stream ends)
+ *   - Hard cap (forced done)
+ */
+import { describe, it, expect } from '@effect/vitest'
+import { Chunk, Effect, Layer, Stream } from 'effect'
+import type OpenAI from 'openai'
+import { IdsTest } from '~/shared/domain/ids'
+import { GroqStub } from '~/shared/infra/groq/client'
+import { RepositoryInMemoryLive } from '~/shared/infra/drizzle/repository'
+import { runLoop } from './loop'
+import { makeCatalog, SessionContext } from './tools/catalog'
+import { builtinTools } from './tools/builtin'
+import type { AgentEvent } from '~/shared/sse/events'
 
-interface CannedTurn {
-  content?: string
-  tool_calls?: Array<{
-    id: string
-    function: { name: string; arguments: string }
-  }>
+interface CannedToolCall {
+  readonly id: string
+  readonly name: string
+  readonly args: Record<string, unknown>
 }
 
-const cannedGroq = (turns: Array<CannedTurn>): GroqClient => {
-  let i = 0
-  return {
-    chatCompletion: vi.fn(async () => {
-      const turn = turns[i++]
-      if (!turn) throw new Error(`unexpected turn ${i}`)
-      return {
-        id: `cmpl_${i}`,
-        object: 'chat.completion',
-        created: 0,
-        model: 'm',
-        choices: [
-          {
-            index: 0,
-            message: {
-              role: 'assistant',
-              content: turn.content ?? '',
-              tool_calls: turn.tool_calls?.map((c) => ({
-                ...c,
-                type: 'function',
-              })),
+const completion = (
+  cmplId: string,
+  opts: { content?: string; toolCalls?: ReadonlyArray<CannedToolCall> },
+): OpenAI.ChatCompletion =>
+  ({
+    id: cmplId,
+    object: 'chat.completion',
+    created: 0,
+    model: 'm',
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: opts.content ?? '',
+          refusal: null,
+          tool_calls: opts.toolCalls?.map((c) => ({
+            id: c.id,
+            type: 'function',
+            function: {
+              name: c.name,
+              arguments: JSON.stringify(c.args),
             },
-            finish_reason: turn.tool_calls ? 'tool_calls' : 'stop',
-            logprobs: null,
-          },
-        ],
-      } as never
-    }),
-  }
-}
+          })),
+        },
+        finish_reason: opts.toolCalls ? 'tool_calls' : 'stop',
+        logprobs: null,
+      },
+    ],
+  }) as OpenAI.ChatCompletion
+
+const SessionFixed = Layer.succeed(SessionContext, { sessionId: 's' })
+
+const TestEnv = Layer.mergeAll(
+  RepositoryInMemoryLive,
+  IdsTest,
+  SessionFixed,
+)
+
+const catalog = makeCatalog(builtinTools)
 
 describe('agent loop', () => {
-  it('halts on HITL pause (askQuestion)', async () => {
-    const groq = cannedGroq([
-      {
-        tool_calls: [
-          {
-            id: 'c1',
-            function: {
+  it.effect('halts on HITL pause (askQuestion)', () =>
+    Effect.gen(function* () {
+      const turns: ReadonlyArray<OpenAI.ChatCompletion> = [
+        completion('c1', {
+          toolCalls: [
+            {
+              id: 'tc1',
               name: 'askQuestion',
-              arguments: JSON.stringify({
+              args: {
                 question: 'q?',
                 recommendation: 'r',
                 rationale: 'why',
-              }),
+              },
             },
-          },
-        ],
-      },
-    ])
+          ],
+        }),
+      ]
 
-    const result = await runLoop({
-      sessionId: 's',
-      prompt: 'go',
-      groq,
-      emit: async () => {},
-      persistQuestion: async () => {},
-      generateQuestionId: () => 'q1',
-    })
+      const events = yield* Stream.runCollect(
+        runLoop({ prompt: 'go' }, catalog),
+      ).pipe(Effect.provide(Layer.merge(TestEnv, GroqStub.layer(turns))))
 
-    expect(result.halt).toBe('paused' satisfies LoopHaltReason)
-    expect(result.questionId).toBe('q1')
-    expect((groq.chatCompletion as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1)
-  })
+      const arr = Chunk.toReadonlyArray(events) as ReadonlyArray<AgentEvent>
+      const types = arr.map((e) => e.type)
+      expect(types).toEqual(['agent_thinking', 'tool_invoked', 'question_asked'])
+      const last = arr[arr.length - 1]!
+      if (last.type !== 'question_asked') throw new Error('expected pause')
+      expect(last.questionId).toBe('q_0001')
+    }),
+  )
 
-  it('continues across non-HITL tools and halts on finalize', async () => {
-    const groq = cannedGroq([
-      {
-        tool_calls: [
-          {
-            id: 'c1',
-            function: {
+  it.effect('continues across non-HITL tools and halts on finalize', () =>
+    Effect.gen(function* () {
+      const turns: ReadonlyArray<OpenAI.ChatCompletion> = [
+        completion('c1', {
+          toolCalls: [
+            {
+              id: 'tc1',
               name: 'echo',
-              arguments: JSON.stringify({ text: 'hi' }),
+              args: { text: 'hi' },
             },
-          },
-        ],
-      },
-      {
-        tool_calls: [
-          {
-            id: 'c2',
-            function: {
+          ],
+        }),
+        completion('c2', {
+          toolCalls: [
+            {
+              id: 'tc2',
               name: 'writeOutput',
-              arguments: JSON.stringify({
+              args: {
                 kind: 'prd_section',
                 section: 'goal',
                 content: 'Build dark mode.',
-              }),
+              },
             },
-          },
-        ],
-      },
-      {
-        tool_calls: [
-          {
-            id: 'c3',
-            function: {
+          ],
+        }),
+        completion('c3', {
+          toolCalls: [
+            {
+              id: 'tc3',
               name: 'finalize',
-              arguments: JSON.stringify({ summary: 'shipped' }),
+              args: { summary: 'shipped' },
             },
-          },
-        ],
-      },
-    ])
+          ],
+        }),
+      ]
 
-    const sectionsWritten: Array<string> = []
-    const result = await runLoop({
-      sessionId: 's',
-      prompt: 'go',
-      groq,
-      emit: async () => {},
-      persistQuestion: async () => {},
-      writePrdSection: async ({ section }) => {
-        sectionsWritten.push(section)
-      },
-    })
+      const events = yield* Stream.runCollect(
+        runLoop({ prompt: 'go' }, catalog),
+      ).pipe(Effect.provide(Layer.merge(TestEnv, GroqStub.layer(turns))))
 
-    expect(result.halt).toBe('finalized')
-    expect(result.summary).toBe('shipped')
-    expect(sectionsWritten).toEqual(['goal'])
-    expect((groq.chatCompletion as ReturnType<typeof vi.fn>).mock.calls.length).toBe(3)
-  })
+      const arr = Chunk.toReadonlyArray(events) as ReadonlyArray<AgentEvent>
+      const types = arr.map((e) => e.type)
+      expect(types).toContain('prd_section_written')
+      const last = arr[arr.length - 1]!
+      if (last.type !== 'done') throw new Error('expected finalize')
+      expect(last.finalText).toBe('shipped')
+    }),
+  )
 
-  it('hits the hard cap and force-finalizes', async () => {
-    const turns: Array<CannedTurn> = []
-    for (let i = 0; i < 200; i++) {
-      turns.push({
-        tool_calls: [
-          {
-            id: `c${i}`,
-            function: {
-              name: 'echo',
-              arguments: JSON.stringify({ text: `n=${i}` }),
-            },
-          },
-        ],
-      })
-    }
-    const groq = cannedGroq(turns)
-    const result = await runLoop({
-      sessionId: 's',
-      prompt: 'go',
-      groq,
-      emit: async () => {},
-      persistQuestion: async () => {},
-      hardCap: 5,
-      softCap: 3,
-    })
+  it.effect('hits the hard cap and force-finalizes', () =>
+    Effect.gen(function* () {
+      const turns: Array<OpenAI.ChatCompletion> = []
+      for (let i = 0; i < 200; i++) {
+        turns.push(
+          completion(`c${i}`, {
+            toolCalls: [
+              {
+                id: `tc${i}`,
+                name: 'echo',
+                args: { text: `n=${i}` },
+              },
+            ],
+          }),
+        )
+      }
 
-    expect(result.halt).toBe('finalized')
-    expect(result.summary).toMatch(/hit step cap/i)
-    expect((groq.chatCompletion as ReturnType<typeof vi.fn>).mock.calls.length).toBe(5)
-  })
+      const events = yield* Stream.runCollect(
+        runLoop(
+          { prompt: 'go', hardCap: 5, softCap: 3 },
+          catalog,
+        ),
+      ).pipe(Effect.provide(Layer.merge(TestEnv, GroqStub.layer(turns))))
+
+      const arr = Chunk.toReadonlyArray(events) as ReadonlyArray<AgentEvent>
+      const last = arr[arr.length - 1]!
+      if (last.type !== 'done') throw new Error('expected forced done')
+      expect(last.finalText).toMatch(/hit step cap/i)
+    }),
+  )
+
+  it.effect('halts on plain assistant text (no tool calls) with done', () =>
+    Effect.gen(function* () {
+      const turns: ReadonlyArray<OpenAI.ChatCompletion> = [
+        completion('c1', { content: 'all set' }),
+      ]
+
+      const events = yield* Stream.runCollect(
+        runLoop({ prompt: 'go' }, catalog),
+      ).pipe(Effect.provide(Layer.merge(TestEnv, GroqStub.layer(turns))))
+
+      const arr = Chunk.toReadonlyArray(events) as ReadonlyArray<AgentEvent>
+      expect(arr.map((e) => e.type)).toEqual(['agent_thinking', 'done'])
+      const last = arr[arr.length - 1]!
+      if (last.type !== 'done') throw new Error('expected done')
+      expect(last.finalText).toBe('all set')
+    }),
+  )
 })

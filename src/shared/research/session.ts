@@ -1,65 +1,71 @@
-import { ResearchSessionStatus } from '~/shared/infra/drizzle/schema'
-
-export interface CreateSessionInput {
-  initialPrompt: string
-}
-
-export interface CreateSessionOutput {
-  sessionId: string
-  eventStreamUrl: string
-}
-
-export interface SessionDeps {
-  /** Inserts the row into research_sessions. */
-  insertSession: (row: {
-    id: string
-    initialPrompt: string
-    status: ResearchSessionStatus
-    createdAt: Date
-    updatedAt: Date
-  }) => Promise<void>
-  /**
-   * Builds the SSE URL the client should subscribe to for this session.
-   * Injected so the worker can choose between absolute / relative URLs and
-   * tests can assert on a stable shape.
-   */
-  buildEventStreamUrl: (sessionId: string) => string
-  generateId?: () => string
-  now?: () => Date
-}
-
 /**
  * Use case: start a new Research Session.
  *
- * Persists the session row and returns the URL the UI should subscribe to
- * for live agent events. The agent loop itself is kicked off by the SSE
- * stream handler when the client connects.
+ * Mints an id, persists the row through `ResearchRepository`, and returns
+ * the SSE URL the client should subscribe to. The Agent Loop is kicked
+ * off when the client connects to that URL — not here.
+ *
+ * Wiring lives in `R`:
+ *
+ *   - `Ids`                    — id minting (live = web crypto, test = sequence)
+ *   - `ResearchRepository`     — persistence seam
+ *   - `EventStreamUrlBuilder`  — how to render the SSE URL (worker vs. DO
+ *                                differ on absolute vs. relative)
+ *   - `Effect`'s built-in `Clock` — `now()` so tests can advance time.
  */
-export const createSession = async (
-  input: CreateSessionInput,
-  deps: SessionDeps,
-): Promise<CreateSessionOutput> => {
-  const initialPrompt = input.initialPrompt?.trim() ?? ''
-  if (initialPrompt.length === 0) {
-    throw new Error('initialPrompt must not be empty')
+import { Clock, Context, Effect } from 'effect'
+import type { RepositoryError } from '~/shared/domain/errors'
+import { Ids } from '~/shared/domain/ids'
+import { ResearchRepository } from '~/shared/infra/drizzle/repository'
+import { ResearchSessionStatus } from '~/shared/infra/drizzle/schema'
+
+export interface CreateSessionInput {
+  readonly initialPrompt: string
+}
+
+export interface CreateSessionOutput {
+  readonly sessionId: string
+  readonly eventStreamUrl: string
+}
+
+/**
+ * Builds the URL the client subscribes to for live agent events.
+ * Injected so the worker can pick absolute / relative shapes and tests
+ * can assert on a stable value.
+ */
+export class EventStreamUrlBuilder extends Context.Tag('EventStreamUrlBuilder')<
+  EventStreamUrlBuilder,
+  {
+    readonly build: (sessionId: string) => string
   }
+>() {}
 
-  const id = (deps.generateId ?? defaultGenerateId)()
-  const now = (deps.now ?? (() => new Date()))()
+export const createSession = (
+  input: CreateSessionInput,
+): Effect.Effect<
+  CreateSessionOutput,
+  RepositoryError,
+  ResearchRepository | Ids | EventStreamUrlBuilder
+> =>
+  Effect.gen(function* () {
+    const ids = yield* Ids
+    const repo = yield* ResearchRepository
+    const urlBuilder = yield* EventStreamUrlBuilder
 
-  await deps.insertSession({
-    id,
-    initialPrompt,
-    status: ResearchSessionStatus.active,
-    createdAt: now,
-    updatedAt: now,
+    const id = yield* ids.mint('rs_')
+    const millis = yield* Clock.currentTimeMillis
+    const now = new Date(millis)
+
+    yield* repo.createSession({
+      id,
+      initialPrompt: input.initialPrompt,
+      status: ResearchSessionStatus.active,
+      createdAt: now,
+      updatedAt: now,
+    })
+
+    return {
+      sessionId: id,
+      eventStreamUrl: urlBuilder.build(id),
+    }
   })
-
-  return { sessionId: id, eventStreamUrl: deps.buildEventStreamUrl(id) }
-}
-
-const defaultGenerateId = (): string => {
-  const bytes = crypto.getRandomValues(new Uint8Array(12))
-  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
-  return `rs_${hex}`
-}
