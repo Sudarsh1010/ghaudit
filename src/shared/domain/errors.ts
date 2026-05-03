@@ -158,6 +158,17 @@ export class Conflict extends Data.TaggedError('Conflict')<{
   readonly reason: string
 }> {}
 
+/**
+ * Cookie owner mismatch on a session-scoped route. Used by Slice 6's
+ * `assertSessionAccess` — the route both proves the request lacks a
+ * valid cookie *and* refuses to disclose whether the session exists,
+ * so this tag also covers "no such session" (privacy: don't leak
+ * existence of session ids).
+ */
+export class Forbidden extends Data.TaggedError('Forbidden')<{
+  readonly reason: string
+}> {}
+
 export type RequestParseError = JsonSyntaxError | SchemaViolation
 
 /* ------------------------------------------------------------------ *
@@ -181,12 +192,15 @@ export type AppError =
   | RequestParseError
   | NotFound
   | Conflict
+  | Forbidden
 
 export const statusForError = (e: AppError): number => {
   switch (e._tag) {
     case 'RepositoryNotFound':
     case 'NotFound':
       return 404
+    case 'Forbidden':
+      return 403
     case 'RepositoryUniqueViolation':
     case 'StateTransitionError':
     case 'Conflict':

@@ -38,6 +38,13 @@ export const researchSessions = sqliteTable(
         ],
       })
       .notNull(),
+    /**
+     * Opaque identifier for the cookie holder that created this session.
+     * The cookie value is the HMAC-signed form of this id (see
+     * `src/shared/auth/cookie.ts`); session-scoped routes verify the
+     * inbound cookie's payload matches `owner_id`.
+     */
+    ownerId: schema.text({ length: 40 }).notNull(),
     createdAt: schema
       .integer({ mode: 'timestamp' })
       .notNull()
