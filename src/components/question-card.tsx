@@ -49,7 +49,20 @@ export function QuestionCard({
       setAnswered(true)
       onAnswered?.()
     } catch (err) {
-      setError((err as Error).message)
+      const tagged = err as {
+        readonly tag?: string
+        readonly retryAfterSeconds?: number
+      }
+      // Rate-limit messages are friendlier as "try again in N seconds"
+      // than the raw tagged-error string. Other errors keep the
+      // generic `err.message` shape (`<tag>: <detail>`).
+      if (tagged.tag === 'RequestRateLimited' && tagged.retryAfterSeconds) {
+        setError(
+          `Rate limited — try again in ${tagged.retryAfterSeconds} seconds.`,
+        )
+      } else {
+        setError((err as Error).message)
+      }
     } finally {
       setSubmitting(false)
     }

@@ -5,6 +5,7 @@ import {
   D1Database,
   DurableObjectNamespace,
   Ai,
+  RateLimit,
 } from 'alchemy/cloudflare'
 
 const app = await alchemy('ghaudit', {
@@ -16,6 +17,30 @@ const ai = Ai()
 const d1 = await D1Database('ghaudit_d1', {
   dev: { remote: false },
   migrationsDir: './drizzle/migrations',
+})
+
+/*
+ * Per-IP rate limits at the worker edge.
+ *
+ *   - Session creation is the expensive operation (mints a DO, kicks off
+ *     a Groq-bounded loop). The Groq free tier is ~1000 requests/day,
+ *     so 10 sessions/min/IP keeps ~6 simultaneous IPs comfortably within
+ *     the daily budget.
+ *
+ *   - Answer submission is normal user activity inside an active session
+ *     and isn't itself a Groq cost driver, so the limit is more permissive.
+ *
+ * `namespace_id` is the binding-local identifier that the runtime uses
+ * to namespace the counters.
+ */
+const sessionRateLimit = RateLimit({
+  namespace_id: 1001,
+  simple: { limit: 10, period: 60 },
+})
+
+const answerRateLimit = RateLimit({
+  namespace_id: 1002,
+  simple: { limit: 60, period: 60 },
 })
 
 export const worker = await TanStackStart('worker', {
@@ -44,6 +69,8 @@ export const worker = await TanStackStart('worker', {
       className: 'ResearchDO',
       sqlite: true,
     }),
+    SESSION_RATELIMIT: sessionRateLimit,
+    ANSWER_RATELIMIT: answerRateLimit,
   },
 })
 
