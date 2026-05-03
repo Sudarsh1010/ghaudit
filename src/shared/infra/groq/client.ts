@@ -1,9 +1,10 @@
 /**
  * `Groq` — Effect service for the LLM seam. The Live layer pins:
  *   - 30s per-call timeout (`GroqNetworkError` on timeout)
- *   - up to 2 retries on transient failures (network / rate-limit), with
- *     exponential backoff (500ms × 2^n)
- *   - no SDK-level retries (we own retry policy)
+ *   - **no client-level retries** — the agent loop owns retry policy
+ *     (1s, 2s, 4s with `error/retry` SSE events between attempts) so
+ *     retrying down here would silently double the work and starve the
+ *     SSE stream of progress signals.
  *
  * Error classification inspects `OpenAI.APIError` (the SDK's exception
  * type) and routes to a tagged variant. Anything else becomes
@@ -14,7 +15,7 @@
  * the old codebase used.
  */
 import OpenAI from 'openai'
-import { Context, Effect, Layer, Ref, Schedule } from 'effect'
+import { Context, Effect, Layer, Ref } from 'effect'
 import {
   type GroqError,
   GroqApiError,
@@ -64,15 +65,11 @@ const classifyError = (cause: unknown): GroqError => {
   return new GroqNetworkError({ cause })
 }
 
-const isRetryable = (e: GroqError): boolean =>
-  e._tag === 'GroqNetworkError' || e._tag === 'GroqRateLimitError'
-
 export interface GroqLiveOptions {
   readonly apiKey: string | undefined
   readonly baseURL?: string
   readonly fetch?: typeof fetch
   readonly timeoutMillis?: number
-  readonly maxRetries?: number
 }
 
 /**
@@ -98,7 +95,6 @@ export const GroqLive = (
         maxRetries: 0,
       })
       const timeoutMs = options.timeoutMillis ?? 30_000
-      const retries = options.maxRetries ?? 2
 
       return Groq.of({
         chatCompletion: (params) =>
@@ -120,11 +116,6 @@ export const GroqLive = (
               onTimeout: (): GroqError =>
                 new GroqNetworkError({ cause: 'timeout' }),
             }),
-            Effect.retry({
-              schedule: Schedule.exponential('500 millis', 2.0),
-              times: retries,
-              while: isRetryable,
-            }),
           ),
       })
     }),
@@ -134,10 +125,23 @@ export const GroqLive = (
  * Test adapter: returns canned `ChatCompletion`s in order. After the list
  * is exhausted, further calls fail with `GroqApiError`. Provide via
  * `Layer.provide(GroqStub.layer([...]))` in `it.effect`.
+ *
+ * Each turn is either a successful `ChatCompletion` or a canned failure
+ * `{ _err }` that the stub raises — useful for driving the loop's retry
+ * and repair paths without spinning up real network failure modes.
  */
+export type GroqStubTurn =
+  | OpenAI.ChatCompletion
+  | { readonly _err: GroqError }
+
+const isErrorTurn = (
+  t: GroqStubTurn,
+): t is { readonly _err: GroqError } =>
+  typeof t === 'object' && t !== null && '_err' in t
+
 export const GroqStub = {
   layer: (
-    turns: ReadonlyArray<OpenAI.ChatCompletion>,
+    turns: ReadonlyArray<GroqStubTurn>,
   ): Layer.Layer<Groq> =>
     Layer.scoped(
       Groq,
@@ -153,6 +157,9 @@ export const GroqStub = {
                   status: 0,
                   body: `GroqStub: no canned response for turn ${i + 1}`,
                 })
+              }
+              if (isErrorTurn(turn)) {
+                return yield* Effect.fail(turn._err)
               }
               return turn
             }),

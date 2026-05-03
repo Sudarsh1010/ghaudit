@@ -43,6 +43,19 @@ const cases: ReadonlyArray<AgentEvent> = [
     content: 'make it dark',
   },
   { id: 6, type: 'done', finalText: 'all good' },
+  {
+    id: 7,
+    type: 'error',
+    kind: 'retry',
+    attempt: 2,
+    reason: 'Groq rate-limited (429)',
+  },
+  {
+    id: 8,
+    type: 'error',
+    kind: 'failed',
+    reason: 'Groq retries exhausted',
+  },
 ]
 
 describe('sse events', () => {

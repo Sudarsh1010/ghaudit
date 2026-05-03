@@ -46,6 +46,11 @@ import {
 } from '~/shared/session/state-machine'
 import { encode, type AgentEvent } from '~/shared/sse/events'
 import { MainLive } from '~/shared/runtime/main'
+import {
+  STATE_TO_DB,
+  persistStepForEvent,
+  transitionEventForLastEvent,
+} from '~/shared/research/orchestrator'
 
 /* ------------------------------------------------------------------ *
  * Request schemas
@@ -69,14 +74,6 @@ const AnswerRequest = Schema.Struct({
 
 const decodeStreamRequest = Schema.decodeUnknown(StreamRequest)
 const decodeAnswerRequest = Schema.decodeUnknown(AnswerRequest)
-
-const STATE_TO_DB: Record<SessionState, ResearchSessionStatus> = {
-  RUNNING: ResearchSessionStatus.active,
-  WAITING_FOR_USER: ResearchSessionStatus.waitingForUser,
-  COMPLETED: ResearchSessionStatus.completed,
-  FAILED: ResearchSessionStatus.failed,
-  ABANDONED: ResearchSessionStatus.abandoned,
-}
 
 /* ------------------------------------------------------------------ *
  * Durable Object
@@ -170,14 +167,16 @@ export class ResearchDO extends DurableObject {
     const sessionId = this.sessionId
 
     const program = Effect.gen(this, function* (this: ResearchDO) {
-      const repo = yield* ResearchRepository
       const catalog = makeCatalog(builtinTools)
-      const lastEventTypeRef = yield* Ref.make<AgentEvent['type'] | undefined>(
-        undefined,
-      )
+      const lastEventRef = yield* Ref.make<AgentEvent | undefined>(undefined)
 
+      // Persist every live event through the orchestrator helper so the
+      // mapping AgentEvent → research_steps row (including the new
+      // status/errorMessage encoding for `error/*` events introduced in
+      // Slice 12) lives in one place. Replay events are not handed to
+      // this function — they're already in the durable log.
       const persistStep = (event: AgentEvent) =>
-        repo.appendStep({ sessionId, event })
+        persistStepForEvent(sessionId, event)
 
       const writeFrame = (event: AgentEvent) =>
         Effect.promise(() => writer.write(encoder.encode(encode(event))))
@@ -196,7 +195,7 @@ export class ResearchDO extends DurableObject {
         Stream.tap((event) =>
           Effect.gen(this, function* (this: ResearchDO) {
             yield* writeFrame(event)
-            yield* Ref.set(lastEventTypeRef, event.type)
+            yield* Ref.set(lastEventRef, event)
             if (event.id + 1 > this.nextStepNumber) {
               this.nextStepNumber = event.id + 1
             }
@@ -205,23 +204,33 @@ export class ResearchDO extends DurableObject {
         Stream.runDrain,
       )
 
-      const lastType = yield* Ref.get(lastEventTypeRef)
-      const transitionEvent: SessionEvent =
-        lastType === 'question_asked' ? 'askQuestion' : 'finalize'
-      yield* this.transitionTo(transitionEvent)
+      const lastEvent = yield* Ref.get(lastEventRef)
+      const transitionEvent: SessionEvent | undefined =
+        lastEvent !== undefined
+          ? transitionEventForLastEvent(lastEvent)
+          : undefined
+      if (transitionEvent !== undefined) {
+        yield* this.transitionTo(transitionEvent)
+      }
     })
 
     void Effect.runPromise(
       program.pipe(
         Effect.catchAllCause((cause) =>
           Effect.gen(this, function* (this: ResearchDO) {
-            const summary = `error: ${Cause.pretty(cause)}`
+            // Non-retryable failure escaped the loop (auth error, schema
+            // mismatch, repository unknown). Surface it as an `error/failed`
+            // event so the frontend renders the persistent banner, persist
+            // a corresponding step row, and transition to FAILED.
+            const reason = Cause.pretty(cause)
             const event: AgentEvent = {
               id: this.nextStepNumber,
-              type: 'done',
-              finalText: summary,
+              type: 'error',
+              kind: 'failed',
+              reason,
             }
             this.nextStepNumber++
+            yield* persistStepForEvent(sessionId, event).pipe(Effect.ignore)
             yield* Effect.promise(() =>
               writer.write(encoder.encode(encode(event))).catch(() => {}),
             )

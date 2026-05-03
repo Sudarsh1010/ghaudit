@@ -36,6 +36,7 @@ import {
   PrdSection,
   ResearchQuestion,
   ResearchSessionRow,
+  ResearchStepRow,
   type SessionStatus,
 } from './schemas'
 import { AgentEvent } from '~/shared/sse/events'
@@ -101,6 +102,9 @@ export class ResearchRepository extends Context.Tag('ResearchRepository')<
       sessionId: string,
       lastEventId: number,
     ) => Effect.Effect<ReadonlyArray<AgentEvent>, RepositoryError>
+    readonly listStepsBySession: (
+      sessionId: string,
+    ) => Effect.Effect<ReadonlyArray<ResearchStepRow>, RepositoryError>
     readonly recordQuestion: (
       input: NewQuestion,
     ) => Effect.Effect<void, RepositoryError>
@@ -166,6 +170,7 @@ interface StepRowFields {
   readonly llmResponse: string | null
   readonly toolRequest: string | null
   readonly toolResponse: string | null
+  readonly errorMessage: string | null
   readonly status: ResearchStepStatus
   readonly event: string
 }
@@ -173,6 +178,11 @@ interface StepRowFields {
 const projectStep = (input: NewStep): StepRowFields => {
   const { event } = input
   const encoded = JSON.stringify(encodeAgentEvent(event))
+  // For `error/*` events the loop owns the failure semantics: `retry`
+  // events stay status:success (mid-recovery) but carry the reason in
+  // `errorMessage`; `failed` is the terminal step (status:failure).
+  const isFailedError = event.type === 'error' && event.kind === 'failed'
+  const errorMessage = event.type === 'error' ? event.reason : null
   return {
     sessionId: input.sessionId,
     stepNumber: event.id,
@@ -187,7 +197,10 @@ const projectStep = (input: NewStep): StepRowFields => {
         : event.type === 'done'
           ? event.finalText
           : null,
-    status: ResearchStepStatus.success,
+    errorMessage,
+    status: isFailedError
+      ? ResearchStepStatus.failure
+      : ResearchStepStatus.success,
     event: encoded,
   }
 }
@@ -218,6 +231,7 @@ const makeD1 = (env: { D1: D1Database }) => {
   const decodeSession = decodeRow(ResearchSessionRow, 'ResearchSession')
   const decodeQuestion = decodeRow(ResearchQuestion, 'ResearchQuestion')
   const decodePrdSection = decodeRow(PrdSection, 'PrdSection')
+  const decodeStep = decodeRow(ResearchStepRow, 'ResearchStep')
 
   return ResearchRepository.of({
     createSession: (input) =>
@@ -277,6 +291,18 @@ const makeD1 = (env: { D1: D1Database }) => {
             .orderBy(asc(researchSteps.stepNumber)),
         )
         return yield* Effect.forEach(rows, (r) => parseEventColumn(r.event))
+      }),
+
+    listStepsBySession: (sessionId) =>
+      Effect.gen(function* () {
+        const rows = yield* tryDb(() =>
+          db
+            .select()
+            .from(researchSteps)
+            .where(eq(researchSteps.sessionId, sessionId))
+            .orderBy(asc(researchSteps.id)),
+        )
+        return yield* Effect.forEach(rows, (r) => decodeStep(r))
       }),
 
     recordQuestion: (input) =>
@@ -378,6 +404,21 @@ interface RawQuestionRow {
   answeredAt: Date | null
 }
 
+interface RawStepRow {
+  id: number
+  sessionId: string
+  stepNumber: number
+  toolName: string | null
+  llmPrompt: string | null
+  llmResponse: string | null
+  toolRequest: string | null
+  toolResponse: string | null
+  errorMessage: string | null
+  status: ResearchStepStatus
+  event: string
+  createdAt: Date
+}
+
 interface RawPrdSectionRow {
   id: number
   sessionId: string
@@ -393,13 +434,15 @@ export const RepositoryInMemoryLive: Layer.Layer<ResearchRepository> =
       const sessions = yield* Ref.make(
         new Map<string, ResearchSessionRow>(),
       )
-      const steps = yield* Ref.make<Array<StepRowFields>>([])
+      const stepSeq = yield* Ref.make(0)
+      const steps = yield* Ref.make<Array<RawStepRow>>([])
       const questions = yield* Ref.make(new Map<string, RawQuestionRow>())
       const prdSeq = yield* Ref.make(0)
       const prdRows = yield* Ref.make<Array<RawPrdSectionRow>>([])
 
       const decodeQuestion = decodeRow(ResearchQuestion, 'ResearchQuestion')
       const decodePrdSection = decodeRow(PrdSection, 'PrdSection')
+      const decodeStep = decodeRow(ResearchStepRow, 'ResearchStep')
 
       return ResearchRepository.of({
         createSession: (input) =>
@@ -445,7 +488,27 @@ export const RepositoryInMemoryLive: Layer.Layer<ResearchRepository> =
           }),
 
         appendStep: (input) =>
-          Ref.update(steps, (arr) => [...arr, projectStep(input)]),
+          Effect.gen(function* () {
+            const id = yield* Ref.modify(stepSeq, (n) => [n + 1, n + 1])
+            const projected = projectStep(input)
+            yield* Ref.update(steps, (arr) => [
+              ...arr,
+              {
+                id,
+                sessionId: projected.sessionId,
+                stepNumber: projected.stepNumber,
+                toolName: projected.toolName,
+                llmPrompt: null,
+                llmResponse: projected.llmResponse,
+                toolRequest: projected.toolRequest,
+                toolResponse: projected.toolResponse,
+                errorMessage: projected.errorMessage,
+                status: projected.status,
+                event: projected.event,
+                createdAt: new Date(),
+              },
+            ])
+          }),
 
         getStepsAfter: (sessionId, lastEventId) =>
           Effect.gen(function* () {
@@ -458,6 +521,15 @@ export const RepositoryInMemoryLive: Layer.Layer<ResearchRepository> =
             return yield* Effect.forEach(filtered, (r) =>
               parseEventColumn(r.event),
             )
+          }),
+
+        listStepsBySession: (sessionId) =>
+          Effect.gen(function* () {
+            const arr = yield* Ref.get(steps)
+            const filtered = arr
+              .filter((r) => r.sessionId === sessionId)
+              .sort((a, b) => a.id - b.id)
+            return yield* Effect.forEach(filtered, (r) => decodeStep(r))
           }),
 
         recordQuestion: (input) =>

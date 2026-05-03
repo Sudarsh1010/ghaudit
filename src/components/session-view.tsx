@@ -21,6 +21,7 @@ import { Effect } from 'effect'
 import {
   decodeMessageEvent,
   type AgentEvent,
+  type ErrorEvent,
   type QuestionAskedEvent,
 } from '~/shared/sse/events'
 import { QuestionCard } from '~/components/question-card'
@@ -68,6 +69,7 @@ export function SessionView({ sessionId }: SessionViewProps) {
       handle('prd_section_written'),
     )
     source.addEventListener('done', handle('done'))
+    source.addEventListener('error', handle('error'))
     source.onerror = () => {
       // EventSource doesn't expose the HTTP status. A failure before any
       // event arrived is almost always the 403 from the cookie check
@@ -86,38 +88,90 @@ export function SessionView({ sessionId }: SessionViewProps) {
   }
 
   return (
-    <section className="grid gap-4 lg:grid-cols-2">
-      <div className="space-y-2">
-        <div className="text-xs text-gray-500">
-          session: <code>{sessionId}</code>
+    <div className="space-y-4">
+      <ErrorBanners events={events} />
+      <section className="grid gap-4 lg:grid-cols-2">
+        <div className="space-y-2">
+          <div className="text-xs text-gray-500">
+            session: <code>{sessionId}</code>
+          </div>
+          <ol className="space-y-2">
+            {events.map((evt) =>
+              evt.type === 'question_asked' ? (
+                <li key={evt.id}>
+                  <QuestionCard
+                    sessionId={sessionId}
+                    question={evt as QuestionAskedEvent}
+                  />
+                </li>
+              ) : (
+                <li
+                  key={evt.id}
+                  className="rounded border border-gray-200 p-2 text-sm"
+                >
+                  <div className="text-xs uppercase tracking-wide text-gray-500">
+                    {evt.type}
+                  </div>
+                  <pre className="whitespace-pre-wrap text-sm">
+                    {renderEvent(evt)}
+                  </pre>
+                </li>
+              ),
+            )}
+          </ol>
         </div>
-        <ol className="space-y-2">
-          {events.map((evt) =>
-            evt.type === 'question_asked' ? (
-              <li key={evt.id}>
-                <QuestionCard
-                  sessionId={sessionId}
-                  question={evt as QuestionAskedEvent}
-                />
-              </li>
-            ) : (
-              <li
-                key={evt.id}
-                className="rounded border border-gray-200 p-2 text-sm"
-              >
-                <div className="text-xs uppercase tracking-wide text-gray-500">
-                  {evt.type}
-                </div>
-                <pre className="whitespace-pre-wrap text-sm">
-                  {renderEvent(evt)}
-                </pre>
-              </li>
-            ),
-          )}
-        </ol>
-      </div>
-      <PrdPane sessionId={sessionId} events={events} />
-    </section>
+        <PrdPane sessionId={sessionId} events={events} />
+      </section>
+    </div>
+  )
+}
+
+/**
+ * Renders the retry / failed status above the event timeline.
+ *
+ *   - `error/failed` is **persistent**: once it appears, the session is
+ *     dead — the loop won't recover, and the user needs to know it
+ *     reached a terminal state.
+ *   - `error/retry` is **transient**: the loop is still trying. We only
+ *     show the retry banner when the *most recent* event is a retry; as
+ *     soon as a successful turn (`agent_thinking`, `tool_invoked`, …)
+ *     comes through, the banner clears.
+ *
+ * `failed` takes precedence over `retry` — once a session has failed,
+ * even past retry events shouldn't shadow that.
+ */
+function ErrorBanners({ events }: { events: ReadonlyArray<AgentEvent> }) {
+  const failed = events.find(
+    (e): e is ErrorEvent => e.type === 'error' && e.kind === 'failed',
+  )
+  const last = events[events.length - 1]
+  const retry: ErrorEvent | undefined =
+    !failed && last?.type === 'error' && last.kind === 'retry'
+      ? last
+      : undefined
+
+  if (!failed && !retry) return null
+
+  return (
+    <div className="space-y-2" role="status" aria-live="polite">
+      {failed && (
+        <div
+          role="alert"
+          className="rounded border border-red-400 bg-red-50 p-3 text-sm text-red-800"
+        >
+          <div className="font-semibold">Session failed</div>
+          <div className="mt-1 whitespace-pre-wrap">{failed.reason}</div>
+        </div>
+      )}
+      {retry && (
+        <div className="rounded border border-amber-300 bg-amber-50 p-3 text-sm text-amber-800">
+          <div className="font-semibold">
+            Retrying… (attempt {retry.attempt ?? '?'} of 3)
+          </div>
+          <div className="mt-1 whitespace-pre-wrap">{retry.reason}</div>
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -204,5 +258,9 @@ function renderEvent(evt: AgentEvent): string {
       return `${evt.question}\n\n→ recommendation: ${evt.recommendation}\n→ rationale: ${evt.rationale}`
     case 'prd_section_written':
       return `[${evt.section}] ${evt.content.slice(0, 80)}…`
+    case 'error':
+      return evt.kind === 'retry'
+        ? `retrying (attempt ${evt.attempt ?? '?'}): ${evt.reason}`
+        : `failed: ${evt.reason}`
   }
 }
