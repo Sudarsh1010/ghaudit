@@ -44,6 +44,7 @@ const PRD_PATH = /^\/session\/([^/]+)\/prd$/
 
 const handleStream = (
   sessionId: string,
+  request: Request,
   env: Env,
 ): Effect.Effect<Response, AppError, ResearchRepository> =>
   Effect.gen(function* () {
@@ -53,11 +54,20 @@ const handleStream = (
         Effect.fail(new NotFound({ resource: `session ${sessionId}` })),
       ),
     )
+    // The browser's EventSource sets `Last-Event-ID` automatically on
+    // reconnect. Coerce non-numeric values to 0 so a missing or
+    // malformed header behaves like "start from scratch".
+    const headerValue = request.headers.get('last-event-id')
+    const parsed = headerValue !== null ? Number(headerValue) : NaN
+    const lastEventId = Number.isFinite(parsed) ? parsed : 0
     return yield* Effect.promise(() =>
       doStub(env, sessionId).fetch('https://do/stream', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ prompt: session.initialPrompt }),
+        body: JSON.stringify({
+          prompt: session.initialPrompt,
+          lastEventId,
+        }),
       }),
     )
   })
@@ -135,7 +145,7 @@ export default {
 
     const streamMatch = url.pathname.match(STREAM_PATH)
     if (streamMatch && request.method === 'GET') {
-      return runRequest(env, handleStream(streamMatch[1]!, env))
+      return runRequest(env, handleStream(streamMatch[1]!, request, env))
     }
 
     const prdMatch = url.pathname.match(PRD_PATH)
