@@ -38,6 +38,13 @@ export const researchSessions = sqliteTable(
         ],
       })
       .notNull(),
+    /**
+     * Opaque identifier for the cookie holder that created this session.
+     * The cookie value is the HMAC-signed form of this id (see
+     * `src/shared/auth/cookie.ts`); session-scoped routes verify the
+     * inbound cookie's payload matches `owner_id`.
+     */
+    ownerId: schema.text({ length: 40 }).notNull(),
     createdAt: schema
       .integer({ mode: 'timestamp' })
       .notNull()
@@ -66,6 +73,13 @@ export const researchSteps = sqliteTable('research_steps', (schema) => ({
   toolRequest: schema.text(),
   toolResponse: schema.text(),
   errorMessage: schema.text(),
+  /**
+   * Source-of-truth for SSE replay (Slice 5): the full encoded
+   * `AgentEvent` (id + type + payload) as JSON. The other columns above
+   * are kept for legibility and ad-hoc SQL — they're derived from this
+   * one and not read by the app.
+   */
+  event: schema.text().notNull(),
   status: schema
     .text({
       mode: 'text',

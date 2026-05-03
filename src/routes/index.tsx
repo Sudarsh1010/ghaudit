@@ -1,80 +1,42 @@
-import { createFileRoute } from '@tanstack/react-router'
-import { Effect } from 'effect'
-import { useEffect, useRef, useState } from 'react'
-import {
-  decodeMessageEvent,
-  type AgentEvent,
-  type QuestionAskedEvent,
-} from '~/shared/sse/events'
-import { QuestionCard } from '~/components/question-card'
+/**
+ * `/` — landing page. Just the prompt form. After a successful
+ * `createSessionFn` call the browser navigates to `/session/$id` (the
+ * durable URL set up by Slice 6); the `Set-Cookie` from that response
+ * is in place by the time the new route mounts and opens its
+ * `EventSource`.
+ *
+ * This route used to host the live event panel inline, which couples
+ * the URL to UI lifecycle (a refresh would lose the session). Slice 6
+ * splits the two: this route only mints, the session URL hosts the
+ * stream.
+ */
+import { createFileRoute, useNavigate } from '@tanstack/react-router'
+import { useState } from 'react'
 import { createSessionFn } from '~/server-fns/session'
 
 export const Route = createFileRoute('/')({ component: App })
 
-interface SessionInfo {
-  readonly sessionId: string
-  readonly eventStreamUrl: string
-}
-
 function App() {
+  const navigate = useNavigate()
   const [prompt, setPrompt] = useState('')
-  const [session, setSession] = useState<SessionInfo | null>(null)
-  const [events, setEvents] = useState<Array<AgentEvent>>([])
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
-  const sourceRef = useRef<EventSource | null>(null)
-
-  useEffect(() => {
-    return () => sourceRef.current?.close()
-  }, [])
 
   const onSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     setError(null)
-    setEvents([])
-    setSession(null)
     setSubmitting(true)
     try {
-      // Typed end-to-end: input is validated against the server-side
-      // Schema, the return shape is inferred from the handler — no
-      // `fetch` boilerplate, no `as` cast, no JSON parsing.
       const created = await createSessionFn({
         data: { initialPrompt: prompt },
       })
-      setSession(created)
-
-      const source = new EventSource(created.eventStreamUrl)
-      sourceRef.current = source
-
-      const handle = (type: AgentEvent['type']) => (e: MessageEvent) => {
-        // Decode through the shared Effect Schema so the wire shape is
-        // validated rather than cast — a drift between server and client
-        // shows up as a rejected promise we silently drop, the same
-        // external behaviour as the old try/catch.
-        Effect.runPromise(
-          decodeMessageEvent(type, {
-            lastEventId: e.lastEventId,
-            data: e.data,
-          }),
-        )
-          .then((evt) => {
-            setEvents((prev) => [...prev, evt])
-            if (type === 'done') source.close()
-          })
-          .catch(() => {
-            /* ignore malformed frame */
-          })
-      }
-      source.addEventListener('agent_thinking', handle('agent_thinking'))
-      source.addEventListener('tool_invoked', handle('tool_invoked'))
-      source.addEventListener('tool_result', handle('tool_result'))
-      source.addEventListener('question_asked', handle('question_asked'))
-      source.addEventListener(
-        'prd_section_written',
-        handle('prd_section_written'),
-      )
-      source.addEventListener('done', handle('done'))
-      source.onerror = () => source.close()
+      // The `Set-Cookie` header from the create response is now in the
+      // browser; navigating to /session/$id loads `SessionView`, which
+      // opens the SSE connection — the request will carry the cookie.
+      await navigate({
+        to: '/session/$id',
+        params: { id: created.sessionId },
+      })
     } catch (err) {
       setError((err as Error).message)
     } finally {
@@ -85,134 +47,31 @@ function App() {
   return (
     <main className="mx-auto max-w-2xl space-y-4 p-6">
       <h1 className="text-2xl font-semibold">Researcher</h1>
-      {!session && (
-        <>
-          <p className="text-sm text-gray-600">
-            Describe the feature you want a PRD for. The agent will respond.
-          </p>
-          <form onSubmit={onSubmit} className="space-y-3">
-            <textarea
-              aria-label="initial prompt"
-              className="min-h-32 w-full rounded border border-gray-300 p-2 font-mono text-sm"
-              value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
-              placeholder="I want to add a dark-mode toggle…"
-            />
-            <button
-              type="submit"
-              disabled={submitting || prompt.trim().length === 0}
-              className="rounded bg-black px-4 py-2 text-white disabled:opacity-50"
-            >
-              {submitting ? 'Starting…' : 'Start Research Session'}
-            </button>
-          </form>
-        </>
-      )}
+      <p className="text-sm text-gray-600">
+        Describe the feature you want a PRD for. The agent will respond.
+      </p>
+      <form onSubmit={onSubmit} className="space-y-3">
+        <textarea
+          aria-label="initial prompt"
+          className="min-h-32 w-full rounded border border-gray-300 p-2 font-mono text-sm"
+          value={prompt}
+          onChange={(e) => setPrompt(e.target.value)}
+          placeholder="I want to add a dark-mode toggle…"
+        />
+        <button
+          type="submit"
+          disabled={submitting || prompt.trim().length === 0}
+          className="rounded bg-black px-4 py-2 text-white disabled:opacity-50"
+        >
+          {submitting ? 'Starting…' : 'Start Research Session'}
+        </button>
+      </form>
 
       {error && (
         <div className="rounded border border-red-300 bg-red-50 p-3 text-sm text-red-700">
           {error}
         </div>
       )}
-
-      {session && (
-        <section className="grid gap-4 lg:grid-cols-2">
-          <div className="space-y-2">
-            <div className="text-xs text-gray-500">
-              session: <code>{session.sessionId}</code>
-            </div>
-            <ol className="space-y-2">
-              {events.map((evt) =>
-                evt.type === 'question_asked' ? (
-                  <li key={evt.id}>
-                    <QuestionCard
-                      sessionId={session.sessionId}
-                      question={evt as QuestionAskedEvent}
-                    />
-                  </li>
-                ) : (
-                  <li
-                    key={evt.id}
-                    className="rounded border border-gray-200 p-2 text-sm"
-                  >
-                    <div className="text-xs uppercase tracking-wide text-gray-500">
-                      {evt.type}
-                    </div>
-                    <pre className="whitespace-pre-wrap text-sm">
-                      {renderEvent(evt)}
-                    </pre>
-                  </li>
-                ),
-              )}
-            </ol>
-          </div>
-          <PrdPane sessionId={session.sessionId} events={events} />
-        </section>
-      )}
     </main>
   )
-}
-
-function PrdPane({
-  sessionId,
-  events,
-}: {
-  sessionId: string
-  events: Array<AgentEvent>
-}) {
-  const sections = new Map<string, string>()
-  for (const evt of events) {
-    if (evt.type === 'prd_section_written') {
-      sections.set(evt.section, evt.content)
-    }
-  }
-  const isDone = events.some((e) => e.type === 'done')
-
-  return (
-    <aside className="space-y-2 rounded border border-gray-200 bg-gray-50 p-3">
-      <div className="flex items-center justify-between">
-        <h2 className="text-sm font-semibold uppercase tracking-wide text-gray-700">
-          PRD
-        </h2>
-        {isDone && (
-          <a
-            href={`/session/${sessionId}/prd`}
-            className="text-xs text-blue-700 underline"
-          >
-            Download .md
-          </a>
-        )}
-      </div>
-      {sections.size === 0 && (
-        <div className="text-xs text-gray-500">
-          PRD sections will appear here as the agent writes them.
-        </div>
-      )}
-      {[...sections.entries()].map(([section, content]) => (
-        <div key={section}>
-          <div className="text-xs font-semibold uppercase text-gray-500">
-            {section}
-          </div>
-          <div className="whitespace-pre-wrap text-sm">{content}</div>
-        </div>
-      ))}
-    </aside>
-  )
-}
-
-function renderEvent(evt: AgentEvent): string {
-  switch (evt.type) {
-    case 'agent_thinking':
-      return evt.text
-    case 'tool_invoked':
-      return `${evt.toolName}(${JSON.stringify(evt.args)})`
-    case 'tool_result':
-      return `→ ${JSON.stringify(evt.result)}`
-    case 'done':
-      return evt.finalText
-    case 'question_asked':
-      return `${evt.question}\n\n→ recommendation: ${evt.recommendation}\n→ rationale: ${evt.rationale}`
-    case 'prd_section_written':
-      return `[${evt.section}] ${evt.content.slice(0, 80)}…`
-  }
 }

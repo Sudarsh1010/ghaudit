@@ -65,6 +65,22 @@ describe('createSession', () => {
     }).pipe(Effect.provide(TestLayer)),
   )
 
+  it.effect(
+    'mints a fresh ownerId per session and persists it on the row',
+    () =>
+      Effect.gen(function* () {
+        const result = yield* createSession({ initialPrompt: 'p' })
+        expect(result.ownerId).toBe('own_0001')
+
+        const repo = yield* ResearchRepository
+        const row = yield* repo.getSessionById(result.sessionId)
+        expect(row.ownerId).toBe('own_0001')
+
+        const second = yield* createSession({ initialPrompt: 'p2' })
+        expect(second.ownerId).toBe('own_0002')
+      }).pipe(Effect.provide(TestLayer)),
+  )
+
   it.effect('threads the EventStreamUrlBuilder through R', () =>
     Effect.gen(function* () {
       const result = yield* createSession({ initialPrompt: 'x' })

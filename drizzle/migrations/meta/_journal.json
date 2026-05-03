@@ -15,6 +15,20 @@
       "when": 1777753441490,
       "tag": "0001_prd_sections_unique_section",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1777779807852,
+      "tag": "0002_research_steps_event_column",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1777814796229,
+      "tag": "0003_research_sessions_owner_id",
+      "breakpoints": true
     }
   ]
 }

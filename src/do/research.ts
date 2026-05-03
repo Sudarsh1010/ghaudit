@@ -33,14 +33,11 @@ import {
   SchemaViolation,
   statusForError,
 } from '~/shared/domain/errors'
-import { runLoop } from '~/shared/agent/loop'
 import { makeCatalog, SessionContext } from '~/shared/agent/tools/catalog'
 import { builtinTools } from '~/shared/agent/tools/builtin'
+import { sessionEventStream } from '~/shared/research/replay'
 import { ResearchRepository } from '~/shared/infra/drizzle/repository'
-import {
-  ResearchSessionStatus,
-  ResearchStepStatus,
-} from '~/shared/infra/drizzle/schema'
+import { ResearchSessionStatus } from '~/shared/infra/drizzle/schema'
 import { Answer } from '~/shared/infra/drizzle/schemas'
 import {
   type SessionEvent,
@@ -56,6 +53,12 @@ import { MainLive } from '~/shared/runtime/main'
 
 const StreamRequest = Schema.Struct({
   prompt: Schema.String,
+  /**
+   * The browser's `Last-Event-ID` (forwarded by the worker entry).
+   * Defaults to 0 — meaning replay everything if the session has any
+   * persisted events, otherwise start fresh.
+   */
+  lastEventId: Schema.optional(Schema.Number),
 })
 
 const AnswerRequest = Schema.Struct({
@@ -157,15 +160,14 @@ export class ResearchDO extends DurableObject {
       return toErrorResponse(new SchemaViolation({ cause: decoded.left }))
     }
 
-    return this.openStream(decoded.right.prompt)
+    return this.openStream(decoded.right.prompt, decoded.right.lastEventId ?? 0)
   }
 
-  private openStream(prompt: string): Response {
+  private openStream(prompt: string, lastEventId: number): Response {
     const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>()
     const writer = writable.getWriter()
     const encoder = new TextEncoder()
     const sessionId = this.sessionId
-    const startStepNumber = this.nextStepNumber
 
     const program = Effect.gen(this, function* (this: ResearchDO) {
       const repo = yield* ResearchRepository
@@ -175,33 +177,24 @@ export class ResearchDO extends DurableObject {
       )
 
       const persistStep = (event: AgentEvent) =>
-        repo.appendStep({
-          sessionId,
-          stepNumber: event.id,
-          toolName: 'toolName' in event ? event.toolName : null,
-          toolRequest:
-            event.type === 'tool_invoked' ? JSON.stringify(event.args) : null,
-          toolResponse:
-            event.type === 'tool_result' ? JSON.stringify(event.result) : null,
-          llmResponse:
-            event.type === 'agent_thinking'
-              ? event.text
-              : event.type === 'done'
-                ? event.finalText
-                : null,
-          status: ResearchStepStatus.success,
-        })
+        repo.appendStep({ sessionId, event })
 
       const writeFrame = (event: AgentEvent) =>
         Effect.promise(() => writer.write(encoder.encode(encode(event))))
 
-      yield* runLoop(
-        { prompt, startStepNumber },
+      // sessionEventStream emits replay events first (already persisted —
+      // we only write frames), then live events (which run through
+      // `persistLive`). Frame writes happen for both so the browser sees
+      // a continuous stream from `lastEventId + 1` onwards.
+      yield* sessionEventStream({
+        prompt,
+        sessionId,
+        lastEventId,
         catalog,
-      ).pipe(
+        persistLive: persistStep,
+      }).pipe(
         Stream.tap((event) =>
           Effect.gen(this, function* (this: ResearchDO) {
-            yield* persistStep(event)
             yield* writeFrame(event)
             yield* Ref.set(lastEventTypeRef, event.type)
             if (event.id + 1 > this.nextStepNumber) {
