@@ -21,6 +21,10 @@
  * Cloudflare env, the program runs, the result is rendered. Worker
  * env access goes through `cloudflare:workers`'s `env` import — the
  * server-function context doesn't expose env directly.
+ *
+ * Slice 13: both endpoints gate through the worker-edge `RateLimiter`
+ * before doing any DB / DO work, keyed by `cf-connecting-ip`. Exhaustion
+ * surfaces as `RequestRateLimited` → 429 + `Retry-After`.
  */
 import { createServerFn } from '@tanstack/react-start'
 import {
@@ -37,12 +41,11 @@ import {
   buildSessionOwnerCookie,
   readSessionOwnerCookie,
 } from '~/shared/auth/header'
-import { type AppError, statusForError } from '~/shared/domain/errors'
+import { type AppError } from '~/shared/domain/errors'
+import { renderError, type ServerFnError } from '~/shared/domain/http-errors'
+import { RateLimiter } from '~/shared/infra/ratelimit/client'
 import { createSession } from '~/shared/research/session'
-import {
-  EventStreamUrlBuilderLive,
-  MainLive,
-} from '~/shared/runtime/main'
+import { EventStreamUrlBuilderLive, MainLive } from '~/shared/runtime/main'
 
 /* ------------------------------------------------------------------ *
  * Input schemas
@@ -60,28 +63,29 @@ const SubmitAnswerInput = Schema.Struct({
 })
 
 /* ------------------------------------------------------------------ *
- * Error rendering — AppError → throwable Error with `tag` + `status`
- * stamped on so the client can branch on them.
+ * Error rendering — `renderError` lives in `~/shared/domain/http-errors`
+ * (single source of truth for AppError → HTTP shape). `renderCause` is
+ * server-fn-specific because the worker entry has its own
+ * cause-rendering path (`Cause.pretty` directly into a 500 Response).
  * ------------------------------------------------------------------ */
-
-interface ServerFnError extends Error {
-  readonly tag: string
-  readonly status: number
-}
-
-const renderError = (err: AppError): ServerFnError => {
-  const detail = 'reason' in err ? err.reason : ''
-  const message = detail ? `${err._tag}: ${detail}` : err._tag
-  const e = new Error(message) as ServerFnError
-  Object.assign(e, { tag: err._tag, status: statusForError(err) })
-  return e
-}
 
 const renderCause = (cause: Cause.Cause<unknown>): ServerFnError => {
   const e = new Error(`internal error: ${Cause.pretty(cause)}`) as ServerFnError
   Object.assign(e, { tag: 'InternalError', status: 500 })
   return e
 }
+
+/* ------------------------------------------------------------------ *
+ * IP extraction
+ *
+ * Cloudflare populates `cf-connecting-ip` for inbound requests on the
+ * edge. Local dev (wrangler/miniflare) sometimes omits it; we fall back
+ * to a sentinel so the rate-limit gate still functions (one shared
+ * bucket for all unidentified clients).
+ * ------------------------------------------------------------------ */
+
+const ipFromRequest = (request: Request): string =>
+  request.headers.get('cf-connecting-ip') ?? 'unknown'
 
 /* ------------------------------------------------------------------ *
  * Runtime boundary
@@ -93,14 +97,24 @@ const renderCause = (cause: Cause.Cause<unknown>): ServerFnError => {
  * around it.
  *
  * The base layer (MainLive + OwnerCookieLive) is also shared — both
- * RPC endpoints need DB + cookie verification. `createSessionFn` adds
- * the per-request `EventStreamUrlBuilderLive` on top.
+ * RPC endpoints need DB + cookie verification + rate-limit gating.
+ * `createSessionFn` adds the per-request `EventStreamUrlBuilderLive`
+ * on top.
  *
  * `requireCookieSecret` reads the env at call-time (not at module load)
  * so a missing secret surfaces as an `Error` thrown from the server-fn
  * boundary the user actually hit, rather than a worker-bootstrap
  * exception buried in platform logs.
  * ------------------------------------------------------------------ */
+
+interface RateLimitEnv {
+  readonly SESSION_RATELIMIT: {
+    readonly limit: (o: { key: string }) => Promise<{ success: boolean }>
+  }
+  readonly ANSWER_RATELIMIT: {
+    readonly limit: (o: { key: string }) => Promise<{ success: boolean }>
+  }
+}
 
 const requireCookieSecret = (): string => {
   const e = env as unknown as { SESSION_COOKIE_SECRET?: string }
@@ -110,11 +124,21 @@ const requireCookieSecret = (): string => {
   return e.SESSION_COOKIE_SECRET
 }
 
-const baseSessionLayer = () =>
-  Layer.merge(
-    MainLive({ D1: env.D1, groq: { apiKey: env.GROQ_API_KEY } }),
+const baseSessionLayer = () => {
+  const rl = env as unknown as RateLimitEnv
+  return Layer.merge(
+    MainLive({
+      D1: env.D1,
+      groq: { apiKey: env.GROQ_API_KEY },
+      rateLimit: {
+        sessionCreate: rl.SESSION_RATELIMIT,
+        answerSubmit: rl.ANSWER_RATELIMIT,
+        periodSeconds: 60,
+      },
+    }),
     OwnerCookieLive(requireCookieSecret()),
   )
+}
 
 const runServerFn = <A, R>(
   layer: Layer.Layer<R, AppError>,
@@ -144,16 +168,20 @@ interface CreateSessionResponse {
 export const createSessionFn = createServerFn({ method: 'POST' })
   .inputValidator(Schema.decodeUnknownSync(CreateSessionInput))
   .handler(async ({ data }): Promise<CreateSessionResponse> => {
-    const url = new URL(getRequest().url)
+    const request = getRequest()
+    const url = new URL(request.url)
+    const key = ipFromRequest(request)
     const layer = Layer.merge(
       baseSessionLayer(),
-      EventStreamUrlBuilderLive(
-        (id) => `${url.origin}/session/${id}/stream`,
-      ),
+      EventStreamUrlBuilderLive((id) => `${url.origin}/session/${id}/stream`),
     )
     const { created, signed } = await runServerFn(
       layer,
       Effect.gen(function* () {
+        // Slice 13: rate-limit before any DB work so an exhausted
+        // client can't burn create-session budget on D1 / Groq.
+        const rl = yield* RateLimiter
+        yield* rl.checkSessionCreate(key)
         const created = yield* createSession(data)
         const cookie = yield* OwnerCookie
         const signed = yield* cookie.sign(created.ownerId)
@@ -198,9 +226,7 @@ interface AnswerErrorBody {
   readonly detail?: string
 }
 
-const isAnswerError = (
-  body: unknown,
-): body is AnswerErrorBody =>
+const isAnswerError = (body: unknown): body is AnswerErrorBody =>
   typeof body === 'object' &&
   body !== null &&
   'error' in body &&
@@ -219,15 +245,22 @@ interface ResearchDONamespace {
 export const submitAnswerFn = createServerFn({ method: 'POST' })
   .inputValidator(Schema.decodeUnknownSync(SubmitAnswerInput))
   .handler(async ({ data }): Promise<AnswerSuccessBody> => {
-    // Cookie check happens *before* we call into the DO. The DO has no
-    // notion of cookies; ownership is enforced at the worker / server-fn
-    // boundary against the row's owner_id.
+    const request = getRequest()
+    const key = ipFromRequest(request)
+    // Slice 13 + Slice 6: rate-limit gate runs first, then cookie
+    // ownership check. Both happen *before* we call into the DO. The
+    // DO has no notion of cookies; ownership is enforced at the
+    // worker / server-fn boundary against the row's owner_id.
     const signedCookie = readSessionOwnerCookie(getRequestHeader('cookie'))
     await runServerFn(
       baseSessionLayer(),
-      assertSessionAccess({
-        sessionId: data.sessionId,
-        signedCookie: signedCookie as Option.Option<string>,
+      Effect.gen(function* () {
+        const rl = yield* RateLimiter
+        yield* rl.checkAnswerSubmit(key)
+        yield* assertSessionAccess({
+          sessionId: data.sessionId,
+          signedCookie: signedCookie as Option.Option<string>,
+        })
       }),
     )
 

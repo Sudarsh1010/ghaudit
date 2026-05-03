@@ -9,6 +9,7 @@
  *   - `BraveSearch`          via `BraveLive` (Brave Search API)
  *   - `Context7`             via `Context7Live` (public Context7 v1)
  *   - `UrlFetcher`           via `UrlFetcherLive` (timeout + size guard)
+ *   - `RateLimiter`          via `RateLimiterLive` (CF rate-limit bindings)
  *
  * Per-request services (`EventStreamUrlBuilder`, `SessionContext`) are
  * NOT in here — those are provided fresh at the request boundary, where
@@ -41,6 +42,11 @@ import {
   UrlFetcherLive,
   type UrlFetcherLiveOptions,
 } from '~/shared/infra/url-fetcher/client'
+import {
+  RateLimiter,
+  RateLimiterLive,
+  type RateLimitBinding,
+} from '~/shared/infra/ratelimit/client'
 import { EventStreamUrlBuilder } from '~/shared/research/session'
 
 export interface MainLiveOptions {
@@ -49,12 +55,38 @@ export interface MainLiveOptions {
   readonly brave?: BraveLiveOptions
   readonly context7?: Context7LiveOptions
   readonly urlFetcher?: UrlFetcherLiveOptions
+  /**
+   * Worker-edge rate-limit bindings. Optional: only the worker entry
+   * (server.ts / server-fns) provides them. The Durable Object lives
+   * behind the worker boundary, so its RateLimiter is a no-op (every
+   * inbound DO request has already passed the worker gate).
+   */
+  readonly rateLimit?: {
+    readonly sessionCreate: RateLimitBinding
+    readonly answerSubmit: RateLimitBinding
+    /**
+     * Window length in seconds. Mirrors the `period` configured on the
+     * underlying `RateLimit()` bindings in `alchemy.run.ts`. Used as the
+     * `Retry-After` value the worker sends on 429s.
+     */
+    readonly periodSeconds: number
+  }
+}
+
+const allowAlways: RateLimitBinding = {
+  limit: async () => ({ success: true }),
 }
 
 export const MainLive = (
   options: MainLiveOptions,
 ): Layer.Layer<
-  Ids | Groq | ResearchRepository | BraveSearch | Context7 | UrlFetcher,
+  | Ids
+  | Groq
+  | ResearchRepository
+  | BraveSearch
+  | Context7
+  | UrlFetcher
+  | RateLimiter,
   GroqAuthError
 > =>
   Layer.mergeAll(
@@ -64,6 +96,13 @@ export const MainLive = (
     BraveLive(options.brave ?? { apiKey: undefined }),
     Context7Live(options.context7 ?? {}),
     UrlFetcherLive(options.urlFetcher ?? {}),
+    RateLimiterLive(
+      options.rateLimit ?? {
+        sessionCreate: allowAlways,
+        answerSubmit: allowAlways,
+        periodSeconds: 60,
+      },
+    ),
   )
 
 /**

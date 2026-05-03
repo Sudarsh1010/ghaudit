@@ -26,10 +26,8 @@ import { Cause, Effect, Layer } from 'effect'
 import { assertSessionAccess } from '~/shared/auth/access'
 import { OwnerCookie, OwnerCookieLive } from '~/shared/auth/cookie'
 import { readSessionOwnerCookie } from '~/shared/auth/header'
-import {
-  type AppError,
-  statusForError,
-} from '~/shared/domain/errors'
+import { type AppError } from '~/shared/domain/errors'
+import { toErrorResponse } from '~/shared/domain/http-errors'
 import { ResearchRepository } from '~/shared/infra/drizzle/repository'
 import { MainLive } from '~/shared/runtime/main'
 
@@ -99,10 +97,7 @@ interface ResearchDONamespace {
   readonly get: (id: unknown) => { fetch: typeof fetch }
 }
 
-const doStub = (
-  env: Env,
-  sessionId: string,
-): { fetch: typeof fetch } => {
+const doStub = (env: Env, sessionId: string): { fetch: typeof fetch } => {
   const ns = env.RESEARCH_DO as unknown as ResearchDONamespace
   return ns.get(ns.idFromName(sessionId))
 }
@@ -110,10 +105,16 @@ const doStub = (
 /* ------------------------------------------------------------------ *
  * Layer composition (per-request)
  *
- * Both remaining handlers only need `ResearchRepository`; the rest of
- * `MainLive` (Ids, Groq) is over-provided. We keep the full live layer
- * so the worker entry stays a one-liner consumer of `MainLive` and the
- * shape mirrors what the DO does.
+ * `/stream` and `/prd` only need `ResearchRepository` + `OwnerCookie`;
+ * `MainLive`'s other services (Ids, Groq, Brave, Context7, UrlFetcher,
+ * RateLimiter) are over-provided. We keep the full live layer so the
+ * worker entry stays a one-liner consumer of `MainLive` and the shape
+ * mirrors what the DO does.
+ *
+ * Slice 13 rate-limit bindings (SESSION_RATELIMIT, ANSWER_RATELIMIT)
+ * gate the two server-fn endpoints (`/session`, `/session/:id/answer`),
+ * not the routes handled here — so we use `MainLive`'s `allowAlways`
+ * fallback rather than threading the env bindings through.
  * ------------------------------------------------------------------ */
 
 const runRequest = (
@@ -151,15 +152,6 @@ const runRequest = (
     ),
   )
 }
-
-const toErrorResponse = (err: AppError): Response =>
-  Response.json(
-    {
-      error: err._tag,
-      detail: 'reason' in err ? err.reason : undefined,
-    },
-    { status: statusForError(err) },
-  )
 
 /* ------------------------------------------------------------------ *
  * Entry

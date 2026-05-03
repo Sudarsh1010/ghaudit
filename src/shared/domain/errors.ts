@@ -18,9 +18,7 @@ import type { ParseResult } from 'effect'
  * Repository
  * ------------------------------------------------------------------ */
 
-export class RepositoryNotFound extends Data.TaggedError(
-  'RepositoryNotFound',
-)<{
+export class RepositoryNotFound extends Data.TaggedError('RepositoryNotFound')<{
   readonly entity: string
   readonly id: string
 }> {}
@@ -63,9 +61,7 @@ export class GroqNetworkError extends Data.TaggedError('GroqNetworkError')<{
   readonly cause: unknown
 }> {}
 
-export class GroqRateLimitError extends Data.TaggedError(
-  'GroqRateLimitError',
-)<{
+export class GroqRateLimitError extends Data.TaggedError('GroqRateLimitError')<{
   readonly retryAfterSeconds?: number
 }> {}
 
@@ -178,9 +174,7 @@ export type UrlFetcherError =
  * Tools
  * ------------------------------------------------------------------ */
 
-export class ToolInputJsonError extends Data.TaggedError(
-  'ToolInputJsonError',
-)<{
+export class ToolInputJsonError extends Data.TaggedError('ToolInputJsonError')<{
   readonly toolName: string
   readonly raw: string
   readonly cause: unknown
@@ -194,9 +188,7 @@ export class ToolInputParseError extends Data.TaggedError(
   readonly cause: ParseResult.ParseError
 }> {}
 
-export class ToolExecutionError extends Data.TaggedError(
-  'ToolExecutionError',
-)<{
+export class ToolExecutionError extends Data.TaggedError('ToolExecutionError')<{
   readonly toolName: string
   readonly cause: unknown
 }> {}
@@ -220,6 +212,17 @@ export class StateTransitionError extends Data.TaggedError(
 )<{
   readonly from: string
   readonly event: string
+}> {}
+
+/* ------------------------------------------------------------------ *
+ * Edge rate limiting
+ * ------------------------------------------------------------------ */
+
+export type RateLimitScope = 'session-create' | 'answer-submit'
+
+export class RequestRateLimited extends Data.TaggedError('RequestRateLimited')<{
+  readonly scope: RateLimitScope
+  readonly retryAfterSeconds: number
 }> {}
 
 /* ------------------------------------------------------------------ *
@@ -286,6 +289,7 @@ export type AppError =
   | BraveError
   | Context7Error
   | UrlFetcherError
+  | RequestRateLimited
 
 export const statusForError = (e: AppError): number => {
   switch (e._tag) {
@@ -308,6 +312,7 @@ export const statusForError = (e: AppError): number => {
       return 502
     case 'GroqRateLimitError':
     case 'BraveRateLimitError':
+    case 'RequestRateLimited':
       return 429
     case 'GroqNetworkError':
     case 'GroqApiError':

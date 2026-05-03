@@ -38,7 +38,7 @@ function App() {
         params: { id: created.sessionId },
       })
     } catch (err) {
-      setError((err as Error).message)
+      setError(formatError(err))
     } finally {
       setSubmitting(false)
     }
@@ -74,4 +74,24 @@ function App() {
       )}
     </main>
   )
+}
+
+/**
+ * Per-route formatter for thrown server-fn errors. We only special-case
+ * `RequestRateLimited` here so the user sees a "try again in N seconds"
+ * message instead of the raw tagged-error string. Everything else falls
+ * back to `err.message`, which already carries `<tag>: <detail>`.
+ *
+ * The shape `{ tag, retryAfterSeconds }` is stamped on by `renderError`
+ * (see `~/shared/domain/http-errors.ts`).
+ */
+function formatError(err: unknown): string {
+  const tagged = err as {
+    readonly tag?: string
+    readonly retryAfterSeconds?: number
+  }
+  if (tagged.tag === 'RequestRateLimited' && tagged.retryAfterSeconds) {
+    return `Rate limited — try again in ${tagged.retryAfterSeconds} seconds.`
+  }
+  return (err as Error).message
 }
