@@ -40,6 +40,7 @@
   "devDependencies": {
     "@cloudflare/vite-plugin": "^1.25.0",
     "@cloudflare/workers-types": "^4.20260214.0",
+    "@effect/vitest": "^0.27.0",
     "@tanstack/devtools-vite": "^0.3.11",
     "@tanstack/eslint-config": "^0.3.0",
     "@testing-library/dom": "^10.4.0",

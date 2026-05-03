@@ -1,29 +1,71 @@
+/**
+ * Durable Object — one Research Session per instance, keyed by session id.
+ *
+ * Effect runtime lives at the request boundary: every endpoint compiles
+ * an `Effect<Response, AppError, R>` program and runs it through
+ * `Effect.runPromise` after providing the live layer. Below the
+ * boundary, every method is an Effect — there's no `try/catch`, no
+ * `await`, no untyped failures.
+ *
+ * Endpoints:
+ *   POST /stream  — start the Agent Loop, return SSE response
+ *   POST /answer  — record the user's reply to an open question
+ *   GET  /prd     — assemble the finished PRD as Markdown
+ *
+ * In-memory state (`this.state`, `this.nextStepNumber`) is the DO's
+ * authoritative cache of the session row; D1 is the durable copy.
+ */
 import type { worker } from '../../alchemy.run'
 import { DurableObject } from 'cloudflare:workers'
-import { drizzle } from 'drizzle-orm/d1'
-import { eq, and, asc } from 'drizzle-orm'
-import { createGroqClient } from '~/shared/infra/groq/client'
-import { runLoop } from '~/shared/agent/loop'
-import { encode, type AgentEvent } from '~/shared/sse/events'
-import { transition, type SessionState } from '~/shared/session/state-machine'
 import {
-  researchSessions,
-  researchSteps,
-  researchQuestions,
-  prdSections,
+  Cause,
+  Clock,
+  Effect,
+  Layer,
+  ParseResult,
+  Ref,
+  Schema,
+  Stream,
+} from 'effect'
+import {
+  type AppError,
+  Conflict,
+  SchemaViolation,
+  statusForError,
+} from '~/shared/domain/errors'
+import { runLoop } from '~/shared/agent/loop'
+import { makeCatalog, SessionContext } from '~/shared/agent/tools/catalog'
+import { builtinTools } from '~/shared/agent/tools/builtin'
+import { ResearchRepository } from '~/shared/infra/drizzle/repository'
+import {
   ResearchSessionStatus,
   ResearchStepStatus,
 } from '~/shared/infra/drizzle/schema'
+import { Answer } from '~/shared/infra/drizzle/schemas'
+import {
+  type SessionEvent,
+  type SessionState,
+  transition,
+} from '~/shared/session/state-machine'
+import { encode, type AgentEvent } from '~/shared/sse/events'
+import { MainLive } from '~/shared/runtime/main'
 
-interface StreamRequestBody {
-  prompt: string
-}
+/* ------------------------------------------------------------------ *
+ * Request schemas
+ * ------------------------------------------------------------------ */
 
-interface AnswerRequestBody {
-  questionId: string
-  kind: 'accept' | 'reject' | 'custom'
-  value?: string
-}
+const StreamRequest = Schema.Struct({
+  prompt: Schema.String,
+})
+
+const AnswerRequest = Schema.Struct({
+  questionId: Schema.String,
+  kind: Schema.Literal('accept', 'reject', 'custom'),
+  value: Schema.optional(Schema.String),
+})
+
+const decodeStreamRequest = Schema.decodeUnknown(StreamRequest)
+const decodeAnswerRequest = Schema.decodeUnknown(AnswerRequest)
 
 const STATE_TO_DB: Record<SessionState, ResearchSessionStatus> = {
   RUNNING: ResearchSessionStatus.active,
@@ -33,10 +75,10 @@ const STATE_TO_DB: Record<SessionState, ResearchSessionStatus> = {
   ABANDONED: ResearchSessionStatus.abandoned,
 }
 
-/**
- * One Research Session lives in one ResearchDO instance, keyed by session id.
- * Slice 4: multi-turn loop with finalize, writeOutput(prd_section), step caps.
- */
+/* ------------------------------------------------------------------ *
+ * Durable Object
+ * ------------------------------------------------------------------ */
+
 export class ResearchDO extends DurableObject {
   declare env: typeof worker.Env
 
@@ -49,31 +91,71 @@ export class ResearchDO extends DurableObject {
 
   override async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url)
+
     if (request.method === 'POST' && url.pathname === '/stream') {
-      const body = (await request.json()) as StreamRequestBody
-      return this.openStream(body.prompt)
+      return this.dispatchStream(request)
     }
     if (request.method === 'POST' && url.pathname === '/answer') {
-      const body = (await request.json()) as AnswerRequestBody
-      return this.handleAnswer(body)
+      return this.runWithLayer(this.handleAnswer(request))
     }
     if (request.method === 'GET' && url.pathname === '/prd') {
-      return this.assemblePrd()
+      return this.runWithLayer(this.assemblePrd())
     }
     return new Response('Not found', { status: 404 })
   }
 
-  private get db() {
-    const env = this.env as unknown as { D1: D1Database }
-    return drizzle(env.D1, { casing: 'snake_case' })
+  /* ---------------------------------------------------------------- *
+   * Layer composition (per-request)
+   * ---------------------------------------------------------------- */
+
+  private layer() {
+    const env = this.env as unknown as {
+      D1: D1Database
+      GROQ_API_KEY?: string
+    }
+    return Layer.merge(
+      MainLive({
+        D1: env.D1,
+        groq: { apiKey: env.GROQ_API_KEY },
+      }),
+      Layer.succeed(SessionContext, { sessionId: this.sessionId }),
+    )
   }
 
-  private async setState(next: SessionState): Promise<void> {
-    this.state = next
-    await this.db
-      .update(researchSessions)
-      .set({ status: STATE_TO_DB[next], updatedAt: new Date() })
-      .where(eq(researchSessions.id, this.sessionId))
+  private runWithLayer(
+    program: Effect.Effect<Response, AppError, ResearchRepository>,
+  ): Promise<Response> {
+    return Effect.runPromise(
+      program.pipe(
+        Effect.catchAll((err) => Effect.succeed(toErrorResponse(err))),
+        Effect.provide(this.layer()),
+        Effect.catchAllCause((cause) =>
+          Effect.succeed(
+            new Response(`internal error: ${Cause.pretty(cause)}`, {
+              status: 500,
+            }),
+          ),
+        ),
+      ),
+    )
+  }
+
+  /* ---------------------------------------------------------------- *
+   * /stream — start the Agent Loop, write SSE frames as they arrive
+   * ---------------------------------------------------------------- */
+
+  private async dispatchStream(request: Request): Promise<Response> {
+    const body = (await request.json().catch(() => null)) as unknown
+    const decoded = await Effect.runPromise(
+      decodeStreamRequest(body).pipe(
+        Effect.either,
+      ),
+    )
+    if (decoded._tag === 'Left') {
+      return toErrorResponse(new SchemaViolation({ cause: decoded.left }))
+    }
+
+    return this.openStream(decoded.right.prompt)
   }
 
   private openStream(prompt: string): Response {
@@ -81,67 +163,82 @@ export class ResearchDO extends DurableObject {
     const writer = writable.getWriter()
     const encoder = new TextEncoder()
     const sessionId = this.sessionId
+    const startStepNumber = this.nextStepNumber
 
-    const env = this.env as unknown as { GROQ_API_KEY?: string }
-    const groq = createGroqClient({ apiKey: env.GROQ_API_KEY })
+    const program = Effect.gen(this, function* (this: ResearchDO) {
+      const repo = yield* ResearchRepository
+      const catalog = makeCatalog(builtinTools)
+      const lastEventTypeRef = yield* Ref.make<AgentEvent['type'] | undefined>(
+        undefined,
+      )
 
-    const persistAndEmit = async (event: AgentEvent): Promise<void> => {
-      await this.persistStep(event)
-      this.nextStepNumber = Math.max(this.nextStepNumber, event.id + 1)
-      await writer.write(encoder.encode(encode(event)))
-    }
-
-    void (async () => {
-      try {
-        const result = await runLoop({
+      const persistStep = (event: AgentEvent) =>
+        repo.appendStep({
           sessionId,
-          prompt,
-          groq,
-          emit: persistAndEmit,
-          startStepNumber: this.nextStepNumber,
-          persistQuestion: async (q) => {
-            await this.db.insert(researchQuestions).values({
-              id: q.id,
-              sessionId,
-              question: q.question,
-              recommendedAnswer: q.recommendation,
-              rationale: q.rationale,
-            })
-          },
-          writePrdSection: async ({ section, content }) => {
-            await this.db
-              .insert(prdSections)
-              .values({ sessionId, section, content })
-              .onConflictDoUpdate({
-                target: [prdSections.sessionId, prdSections.section],
-                set: { content, updatedAt: new Date() },
-              })
-          },
+          stepNumber: event.id,
+          toolName: 'toolName' in event ? event.toolName : null,
+          toolRequest:
+            event.type === 'tool_invoked' ? JSON.stringify(event.args) : null,
+          toolResponse:
+            event.type === 'tool_result' ? JSON.stringify(event.result) : null,
+          llmResponse:
+            event.type === 'agent_thinking'
+              ? event.text
+              : event.type === 'done'
+                ? event.finalText
+                : null,
+          status: ResearchStepStatus.success,
         })
 
-        if (result.halt === 'paused') {
-          const t = transition(this.state, 'askQuestion')
-          if (t.ok) await this.setState(t.state)
-        } else if (result.halt === 'finalized') {
-          const t = transition(this.state, 'finalize')
-          if (t.ok) await this.setState(t.state)
-        } else {
-          const t = transition(this.state, 'fail')
-          if (t.ok) await this.setState(t.state)
-        }
-      } catch (err) {
-        const errorEvent = encode({
-          id: this.nextStepNumber++,
-          type: 'done',
-          finalText: `error: ${(err as Error).message}`,
-        })
-        await writer.write(encoder.encode(errorEvent))
-        const t = transition(this.state, 'fail')
-        if (t.ok) await this.setState(t.state)
-      } finally {
-        await writer.close().catch(() => {})
-      }
-    })()
+      const writeFrame = (event: AgentEvent) =>
+        Effect.promise(() => writer.write(encoder.encode(encode(event))))
+
+      yield* runLoop(
+        { prompt, startStepNumber },
+        catalog,
+      ).pipe(
+        Stream.tap((event) =>
+          Effect.gen(this, function* (this: ResearchDO) {
+            yield* persistStep(event)
+            yield* writeFrame(event)
+            yield* Ref.set(lastEventTypeRef, event.type)
+            if (event.id + 1 > this.nextStepNumber) {
+              this.nextStepNumber = event.id + 1
+            }
+          }),
+        ),
+        Stream.runDrain,
+      )
+
+      const lastType = yield* Ref.get(lastEventTypeRef)
+      const transitionEvent: SessionEvent =
+        lastType === 'question_asked' ? 'askQuestion' : 'finalize'
+      yield* this.transitionTo(transitionEvent)
+    })
+
+    void Effect.runPromise(
+      program.pipe(
+        Effect.catchAllCause((cause) =>
+          Effect.gen(this, function* (this: ResearchDO) {
+            const summary = `error: ${Cause.pretty(cause)}`
+            const event: AgentEvent = {
+              id: this.nextStepNumber,
+              type: 'done',
+              finalText: summary,
+            }
+            this.nextStepNumber++
+            yield* Effect.promise(() =>
+              writer.write(encoder.encode(encode(event))).catch(() => {}),
+            )
+            yield* this.transitionTo('fail').pipe(Effect.ignore)
+          }),
+        ),
+        Effect.provide(this.layer()),
+        Effect.ensuring(
+          Effect.promise(() => writer.close().catch(() => {})),
+        ),
+      ),
+    )
 
     return new Response(readable, {
       headers: {
@@ -152,103 +249,117 @@ export class ResearchDO extends DurableObject {
     })
   }
 
-  private async handleAnswer(body: AnswerRequestBody): Promise<Response> {
-    if (this.state !== 'WAITING_FOR_USER') {
-      return Response.json(
-        { error: `cannot answer in state ${this.state}` },
-        { status: 409 },
-      )
-    }
-    if (!['accept', 'reject', 'custom'].includes(body.kind)) {
-      return Response.json({ error: 'invalid_kind' }, { status: 400 })
-    }
+  /* ---------------------------------------------------------------- *
+   * /answer — record the user's reply to an open question
+   * ---------------------------------------------------------------- */
 
-    const [question] = await this.db
-      .select()
-      .from(researchQuestions)
-      .where(
-        and(
-          eq(researchQuestions.id, body.questionId),
-          eq(researchQuestions.sessionId, this.sessionId),
+  private handleAnswer(
+    request: Request,
+  ): Effect.Effect<Response, AppError, ResearchRepository> {
+    return Effect.gen(this, function* (this: ResearchDO) {
+      if (this.state !== 'WAITING_FOR_USER') {
+        return yield* new Conflict({
+          reason: `cannot answer in state ${this.state}`,
+        })
+      }
+
+      const raw = yield* Effect.tryPromise({
+        try: () => request.json() as Promise<unknown>,
+        catch: (cause) =>
+          new SchemaViolation({
+            cause: cause as ParseResult.ParseError,
+          }),
+      })
+
+      const body = yield* decodeAnswerRequest(raw).pipe(
+        Effect.mapError(
+          (cause: ParseResult.ParseError) => new SchemaViolation({ cause }),
         ),
       )
-      .limit(1)
 
-    if (!question || question.userReply !== null) {
-      return Response.json({ error: 'no_open_question' }, { status: 404 })
-    }
+      const repo = yield* ResearchRepository
+      // Verify the question is open before recording — repo raises a
+      // RepositoryNotFound (mapped to 404) if the question is missing
+      // or already answered.
+      yield* repo.findOpenQuestion(this.sessionId, body.questionId)
 
-    await this.db
-      .update(researchQuestions)
-      .set({
-        userReply: JSON.stringify({ kind: body.kind, value: body.value }),
-        answeredAt: new Date(),
-      })
-      .where(eq(researchQuestions.id, body.questionId))
-
-    const t = transition(this.state, 'answer')
-    if (!t.ok) {
-      return Response.json({ error: t.error.message }, { status: 409 })
-    }
-    await this.setState(t.state)
-
-    return Response.json({ ok: true, state: this.state })
-  }
-
-  private async assemblePrd(): Promise<Response> {
-    const [row] = await this.db
-      .select()
-      .from(researchSessions)
-      .where(eq(researchSessions.id, this.sessionId))
-      .limit(1)
-
-    if (!row) return new Response('session not found', { status: 404 })
-    if (row.status !== ResearchSessionStatus.completed) {
-      return new Response(
-        `PRD not ready (session is ${row.status}). Finalize the session first.`,
-        { status: 409 },
+      const millis = yield* Clock.currentTimeMillis
+      const now = new Date(millis)
+      yield* repo.recordAnswer(
+        body.questionId,
+        Answer.make({ kind: body.kind, value: body.value }),
+        now,
       )
-    }
 
-    const sections = await this.db
-      .select()
-      .from(prdSections)
-      .where(eq(prdSections.sessionId, this.sessionId))
-      .orderBy(asc(prdSections.id))
+      yield* this.transitionTo('answer')
 
-    const body = sections
-      .map((s) => `## ${humanise(s.section)}\n\n${s.content}\n`)
-      .join('\n')
-
-    const md = `# PRD: ${row.initialPrompt}\n\n${body || '_(no sections written)_'}\n`
-
-    return new Response(md, {
-      headers: {
-        'content-type': 'text/markdown; charset=utf-8',
-        'content-disposition': `attachment; filename="prd-${this.sessionId}.md"`,
-      },
+      return Response.json({ ok: true, state: this.state })
     })
   }
 
-  private async persistStep(event: AgentEvent): Promise<void> {
-    await this.db.insert(researchSteps).values({
-      sessionId: this.sessionId,
-      stepNumber: event.id,
-      toolName: 'toolName' in event ? event.toolName : null,
-      toolRequest:
-        event.type === 'tool_invoked' ? JSON.stringify(event.args) : null,
-      toolResponse:
-        event.type === 'tool_result' ? JSON.stringify(event.result) : null,
-      llmResponse:
-        event.type === 'agent_thinking'
-          ? event.text
-          : event.type === 'done'
-            ? event.finalText
-            : null,
-      status: ResearchStepStatus.success,
+  /* ---------------------------------------------------------------- *
+   * /prd — assemble the PRD from prd_sections + initial prompt
+   * ---------------------------------------------------------------- */
+
+  private assemblePrd(): Effect.Effect<Response, AppError, ResearchRepository> {
+    return Effect.gen(this, function* (this: ResearchDO) {
+      const repo = yield* ResearchRepository
+      const session = yield* repo.getSessionById(this.sessionId)
+
+      if (session.status !== ResearchSessionStatus.completed) {
+        return yield* new Conflict({
+          reason: `PRD not ready (session is ${session.status}). Finalize the session first.`,
+        })
+      }
+
+      const sections = yield* repo.listPrdSections(this.sessionId)
+      const body = sections
+        .map((s) => `## ${humanise(s.section)}\n\n${s.content}\n`)
+        .join('\n')
+      const md = `# PRD: ${session.initialPrompt}\n\n${body || '_(no sections written)_'}\n`
+
+      return new Response(md, {
+        headers: {
+          'content-type': 'text/markdown; charset=utf-8',
+          'content-disposition': `attachment; filename="prd-${this.sessionId}.md"`,
+        },
+      })
+    })
+  }
+
+  /* ---------------------------------------------------------------- *
+   * State transitions — invalid transitions are silent no-ops, same as
+   * the pre-Effect code. (Surfacing every drop would crash the DO on
+   * benign races; logging is the right escalation later.)
+   * ---------------------------------------------------------------- */
+
+  private transitionTo(
+    event: SessionEvent,
+  ): Effect.Effect<void, never, ResearchRepository> {
+    return Effect.gen(this, function* (this: ResearchDO) {
+      const next = yield* transition(this.state, event).pipe(
+        Effect.orElseSucceed(() => this.state),
+      )
+      if (next === this.state) return
+      const repo = yield* ResearchRepository
+      const millis = yield* Clock.currentTimeMillis
+      yield* repo
+        .setSessionStatus(this.sessionId, STATE_TO_DB[next], new Date(millis))
+        .pipe(Effect.ignore)
+      this.state = next
     })
   }
 }
+
+/* ------------------------------------------------------------------ *
+ * Helpers
+ * ------------------------------------------------------------------ */
+
+const toErrorResponse = (err: AppError): Response =>
+  Response.json(
+    { error: err._tag, detail: ('reason' in err ? err.reason : undefined) },
+    { status: statusForError(err) },
+  )
 
 const humanise = (slug: string): string =>
   slug.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())

@@ -1,100 +1,168 @@
 /**
- * Discriminated union of every event the agent loop can emit over SSE.
- * Each event carries an `id` matching the corresponding `research_steps.step_number`,
- * which lets the client request replay via `Last-Event-ID` (Slice 5).
+ * `AgentEvent` — every event the Agent Loop can emit, defined once as an
+ * Effect Schema and consumed by both the Durable Object emitter and the
+ * browser EventSource consumer.
+ *
+ * Wire format (unchanged from the pre-Effect codec):
+ *
+ *     id: <stepNumber>\n
+ *     event: <type>\n
+ *     data: <json payload, sans id+type>\n
+ *     \n
+ *
+ * The Schema encodes the *full* record (including id+type); the wire codec
+ * adapts that record into the SSE envelope.
  */
-export type AgentEvent =
-  | AgentThinkingEvent
-  | ToolInvokedEvent
-  | ToolResultEvent
-  | QuestionAskedEvent
-  | PrdSectionWrittenEvent
-  | DoneEvent
+import { Effect, ParseResult, Schema } from 'effect'
+import { JsonSyntaxError, SchemaViolation } from '~/shared/domain/errors'
 
-export interface AgentThinkingEvent {
-  id: number
-  type: 'agent_thinking'
-  text: string
-}
+/* ------------------------------------------------------------------ *
+ * Per-event Schemas
+ * ------------------------------------------------------------------ */
 
-export interface ToolInvokedEvent {
-  id: number
-  type: 'tool_invoked'
-  toolName: string
-  args: unknown
-}
+export const AgentThinkingEvent = Schema.Struct({
+  id: Schema.Number,
+  type: Schema.Literal('agent_thinking'),
+  text: Schema.String,
+})
+export type AgentThinkingEvent = Schema.Schema.Type<typeof AgentThinkingEvent>
 
-export interface ToolResultEvent {
-  id: number
-  type: 'tool_result'
-  toolName: string
-  result: unknown
-}
+export const ToolInvokedEvent = Schema.Struct({
+  id: Schema.Number,
+  type: Schema.Literal('tool_invoked'),
+  toolName: Schema.String,
+  args: Schema.Unknown,
+})
+export type ToolInvokedEvent = Schema.Schema.Type<typeof ToolInvokedEvent>
 
-export interface QuestionAskedEvent {
-  id: number
-  type: 'question_asked'
-  questionId: string
-  question: string
-  recommendation: string
-  rationale: string
-  kind: 'single'
-}
+export const ToolResultEvent = Schema.Struct({
+  id: Schema.Number,
+  type: Schema.Literal('tool_result'),
+  toolName: Schema.String,
+  result: Schema.Unknown,
+})
+export type ToolResultEvent = Schema.Schema.Type<typeof ToolResultEvent>
 
-export interface PrdSectionWrittenEvent {
-  id: number
-  type: 'prd_section_written'
-  section: string
-  content: string
-}
+export const QuestionAskedEvent = Schema.Struct({
+  id: Schema.Number,
+  type: Schema.Literal('question_asked'),
+  questionId: Schema.String,
+  question: Schema.String,
+  recommendation: Schema.String,
+  rationale: Schema.String,
+  kind: Schema.Literal('single'),
+})
+export type QuestionAskedEvent = Schema.Schema.Type<typeof QuestionAskedEvent>
 
-export interface DoneEvent {
-  id: number
-  type: 'done'
-  finalText: string
-}
+export const PrdSectionWrittenEvent = Schema.Struct({
+  id: Schema.Number,
+  type: Schema.Literal('prd_section_written'),
+  section: Schema.String,
+  content: Schema.String,
+})
+export type PrdSectionWrittenEvent = Schema.Schema.Type<
+  typeof PrdSectionWrittenEvent
+>
 
-const KNOWN_TYPES = new Set<AgentEvent['type']>([
-  'agent_thinking',
-  'tool_invoked',
-  'tool_result',
-  'question_asked',
-  'prd_section_written',
-  'done',
-])
+export const DoneEvent = Schema.Struct({
+  id: Schema.Number,
+  type: Schema.Literal('done'),
+  finalText: Schema.String,
+})
+export type DoneEvent = Schema.Schema.Type<typeof DoneEvent>
+
+export const AgentEvent = Schema.Union(
+  AgentThinkingEvent,
+  ToolInvokedEvent,
+  ToolResultEvent,
+  QuestionAskedEvent,
+  PrdSectionWrittenEvent,
+  DoneEvent,
+)
+export type AgentEvent = Schema.Schema.Type<typeof AgentEvent>
+
+/* ------------------------------------------------------------------ *
+ * Wire codec
+ * ------------------------------------------------------------------ */
+
+const encodeAgentEvent = Schema.encodeSync(AgentEvent)
+const decodeAgentEventEffect = Schema.decodeUnknown(AgentEvent)
 
 /**
- * Serialise one event to the SSE wire format. The `data` payload is the
- * event minus the envelope fields (`id`, `type`).
+ * Render one event as an SSE frame. Internally encodes through the Schema
+ * (so the frame body always matches the declared shape) and then peels off
+ * the envelope fields into the SSE prelude.
  */
 export const encode = (event: AgentEvent): string => {
-  const { id, type, ...payload } = event as AgentEvent & Record<string, unknown>
-  const data = JSON.stringify(payload)
-  return `id: ${id}\nevent: ${type}\ndata: ${data}\n\n`
+  const encoded = encodeAgentEvent(event) as Record<string, unknown> & {
+    id: number
+    type: string
+  }
+  const { id, type, ...payload } = encoded
+  return `id: ${id}\nevent: ${type}\ndata: ${JSON.stringify(payload)}\n\n`
 }
 
 /**
- * Parse one SSE frame back into a typed event. Throws on unknown event type
- * so the caller can decide whether to drop or surface the error.
+ * Parse one SSE frame back into a typed `AgentEvent`. Fails with
+ * `JsonSyntaxError` if the data line isn't JSON, or `SchemaViolation` if
+ * the assembled record doesn't satisfy the union (unknown event type
+ * shows up here as `SchemaViolation`).
  */
-export const parse = (raw: string): AgentEvent => {
-  let id: number | null = null
-  let type: string | null = null
-  let dataRaw: string | null = null
+export const decode = (
+  raw: string,
+): Effect.Effect<AgentEvent, JsonSyntaxError | SchemaViolation> =>
+  Effect.gen(function* () {
+    let id: number | null = null
+    let type: string | null = null
+    let dataRaw: string | null = null
 
-  for (const line of raw.split('\n')) {
-    if (line.startsWith('id: ')) id = Number(line.slice(4))
-    else if (line.startsWith('event: ')) type = line.slice(7)
-    else if (line.startsWith('data: ')) dataRaw = line.slice(6)
-  }
+    for (const line of raw.split('\n')) {
+      if (line.startsWith('id: ')) id = Number(line.slice(4))
+      else if (line.startsWith('event: ')) type = line.slice(7)
+      else if (line.startsWith('data: ')) dataRaw = line.slice(6)
+    }
 
-  if (id === null || type === null || dataRaw === null) {
-    throw new Error('malformed sse frame')
-  }
-  if (!KNOWN_TYPES.has(type as AgentEvent['type'])) {
-    throw new Error(`unknown event type: ${type}`)
-  }
+    if (id === null || Number.isNaN(id) || type === null || dataRaw === null) {
+      return yield* new JsonSyntaxError({
+        cause: 'malformed sse frame',
+      })
+    }
 
-  const payload = JSON.parse(dataRaw) as Record<string, unknown>
-  return { id, type, ...payload } as AgentEvent
-}
+    const payload = yield* Effect.try({
+      try: () => JSON.parse(dataRaw) as Record<string, unknown>,
+      catch: (cause) => new JsonSyntaxError({ cause }),
+    })
+
+    return yield* decodeAgentEventEffect({ id, type, ...payload }).pipe(
+      Effect.mapError(
+        (cause: ParseResult.ParseError) => new SchemaViolation({ cause }),
+      ),
+    )
+  })
+
+/**
+ * Decode an SSE `MessageEvent` (browser side). Reassembles `lastEventId`
+ * and the `type` from the EventSource into the same record shape used on
+ * the wire.
+ */
+export const decodeMessageEvent = (
+  type: AgentEvent['type'],
+  msg: { lastEventId: string; data: string },
+): Effect.Effect<AgentEvent, JsonSyntaxError | SchemaViolation> =>
+  Effect.gen(function* () {
+    const id = Number(msg.lastEventId)
+    if (Number.isNaN(id)) {
+      return yield* new JsonSyntaxError({
+        cause: `non-numeric lastEventId: ${msg.lastEventId}`,
+      })
+    }
+    const payload = yield* Effect.try({
+      try: () => JSON.parse(msg.data) as Record<string, unknown>,
+      catch: (cause) => new JsonSyntaxError({ cause }),
+    })
+    return yield* decodeAgentEventEffect({ id, type, ...payload }).pipe(
+      Effect.mapError(
+        (cause: ParseResult.ParseError) => new SchemaViolation({ cause }),
+      ),
+    )
+  })

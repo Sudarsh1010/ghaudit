@@ -1,6 +1,11 @@
 import { createFileRoute } from '@tanstack/react-router'
+import { Effect } from 'effect'
 import { useEffect, useRef, useState } from 'react'
-import type { AgentEvent, QuestionAskedEvent } from '~/shared/sse/events'
+import {
+  decodeMessageEvent,
+  type AgentEvent,
+  type QuestionAskedEvent,
+} from '~/shared/sse/events'
 import { QuestionCard } from '~/components/question-card'
 
 export const Route = createFileRoute('/')({ component: App })
@@ -45,18 +50,23 @@ function App() {
       sourceRef.current = source
 
       const handle = (type: AgentEvent['type']) => (e: MessageEvent) => {
-        try {
-          const payload = JSON.parse(e.data) as Record<string, unknown>
-          const evt = {
-            id: Number(e.lastEventId),
-            type,
-            ...payload,
-          } as AgentEvent
-          setEvents((prev) => [...prev, evt])
-          if (type === 'done') source.close()
-        } catch {
-          /* ignore malformed frame */
-        }
+        // Decode through the shared Effect Schema so the wire shape is
+        // validated rather than cast — a drift between server and client
+        // shows up as a rejected promise we silently drop, the same
+        // external behaviour as the old try/catch.
+        Effect.runPromise(
+          decodeMessageEvent(type, {
+            lastEventId: e.lastEventId,
+            data: e.data,
+          }),
+        )
+          .then((evt) => {
+            setEvents((prev) => [...prev, evt])
+            if (type === 'done') source.close()
+          })
+          .catch(() => {
+            /* ignore malformed frame */
+          })
       }
       source.addEventListener('agent_thinking', handle('agent_thinking'))
       source.addEventListener('tool_invoked', handle('tool_invoked'))
