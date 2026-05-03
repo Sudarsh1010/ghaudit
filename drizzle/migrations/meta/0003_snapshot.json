@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "b0518cf6-15e2-4c1f-b29f-2a46c7d77e84",
-  "prevId": "a88c3995-b65b-46fa-a104-fa28cae34a0f",
+  "id": "92f788bf-7f83-4a8e-9c56-a0b62f95ae0a",
+  "prevId": "b0518cf6-15e2-4c1f-b29f-2a46c7d77e84",
   "tables": {
     "prd_sections": {
       "name": "prd_sections",
@@ -321,6 +321,13 @@
         "status": {
           "name": "status",
           "type": "text(20)",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "owner_id": {
+          "name": "owner_id",
+          "type": "text(40)",
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false

@@ -50,15 +50,27 @@ const handleStream = (
   env: Env,
 ): Effect.Effect<Response, AppError, ResearchRepository | OwnerCookie> =>
   Effect.gen(function* () {
+    // Slice 6: cookie ownership is checked at this seam (the DO has no
+    // notion of cookies). `assertSessionAccess` returns the row so we
+    // don't pay a second `getSessionById` round-trip below.
     const session = yield* assertSessionAccess({
       sessionId,
       signedCookie: readSessionOwnerCookie(request.headers.get('cookie')),
     })
+    // Slice 5: the browser's EventSource sets `Last-Event-ID` automatically
+    // on reconnect. Coerce non-numeric values to 0 so a missing or
+    // malformed header behaves like "start from scratch".
+    const headerValue = request.headers.get('last-event-id')
+    const parsed = headerValue !== null ? Number(headerValue) : NaN
+    const lastEventId = Number.isFinite(parsed) ? parsed : 0
     return yield* Effect.promise(() =>
       doStub(env, sessionId).fetch('https://do/stream', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ prompt: session.initialPrompt }),
+        body: JSON.stringify({
+          prompt: session.initialPrompt,
+          lastEventId,
+        }),
       }),
     )
   })
