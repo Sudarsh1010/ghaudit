@@ -71,6 +71,22 @@ export const DoneEvent = Schema.Struct({
 })
 export type DoneEvent = Schema.Schema.Type<typeof DoneEvent>
 
+/**
+ * `ErrorEvent` — surfaces transient retries during backoff windows
+ * (`kind: 'retry'`) and the final failure when the loop transitions to
+ * `FAILED` (`kind: 'failed'`). The frontend keys off `kind` to render a
+ * dismiss-able banner vs. a persistent one.
+ */
+export const ErrorEvent = Schema.Struct({
+  id: Schema.Number,
+  type: Schema.Literal('error'),
+  kind: Schema.Literal('retry', 'failed'),
+  /** Only present on retry events; 1-indexed attempt number. */
+  attempt: Schema.optional(Schema.Number),
+  reason: Schema.String,
+})
+export type ErrorEvent = Schema.Schema.Type<typeof ErrorEvent>
+
 export const AgentEvent = Schema.Union(
   AgentThinkingEvent,
   ToolInvokedEvent,
@@ -78,6 +94,7 @@ export const AgentEvent = Schema.Union(
   QuestionAskedEvent,
   PrdSectionWrittenEvent,
   DoneEvent,
+  ErrorEvent,
 )
 export type AgentEvent = Schema.Schema.Type<typeof AgentEvent>
 
