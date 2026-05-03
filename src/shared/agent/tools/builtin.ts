@@ -1,11 +1,17 @@
 /**
- * Built-in tool definitions — the four tools the Agent Loop ships with.
+ * Built-in tool definitions — the tools the Agent Loop ships with.
  *
- *   - `echoTool`         — diagnostic; replays its argument back to the LLM.
- *   - `askQuestionTool`  — HITL pause; persists a Question and signals the
- *                          loop to wait for the user.
- *   - `writeOutputTool`  — appends/overwrites a PRD section.
- *   - `finalizeTool`     — closes the session.
+ *   Diagnostics / orchestration:
+ *     - `echoTool`         — diagnostic; replays its argument back to the LLM.
+ *     - `askQuestionTool`  — HITL pause; persists a Question and signals the
+ *                            loop to wait for the user.
+ *     - `writeOutputTool`  — appends/overwrites a PRD section.
+ *     - `finalizeTool`     — closes the session.
+ *
+ *   Research (slice 7 — see `./research.ts`):
+ *     - `webSearchTool`         — Brave Search.
+ *     - `searchLibraryDocsTool` — Context7 public API.
+ *     - `readUrlTool`           — generic URL → readable text.
  *
  * Each tool's input shape is an Effect Schema so the dispatcher can
  * decode raw JSON arguments before `execute` runs. The Schemas are also
@@ -24,6 +30,7 @@ import {
   WroteOutput,
 } from '~/shared/infra/ai/tool'
 import { SessionContext } from './catalog'
+import { researchTools } from './research'
 
 /* ------------------------------------------------------------------ *
  * echo
@@ -130,4 +137,5 @@ export const builtinTools = [
   askQuestionTool,
   writeOutputTool,
   finalizeTool,
+  ...researchTools,
 ] as const

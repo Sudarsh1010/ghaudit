@@ -112,11 +112,13 @@ export class ResearchDO extends DurableObject {
     const env = this.env as unknown as {
       D1: D1Database
       GROQ_API_KEY?: string
+      BRAVE_API_KEY?: string
     }
     return Layer.merge(
       MainLive({
         D1: env.D1,
         groq: { apiKey: env.GROQ_API_KEY },
+        brave: { apiKey: env.BRAVE_API_KEY },
       }),
       Layer.succeed(SessionContext, { sessionId: this.sessionId }),
     )

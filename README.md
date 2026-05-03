@@ -18,12 +18,19 @@ See [`CONTEXT.md`](./CONTEXT.md) for the domain language.
 
 ## Required secrets
 
-| Name           | Purpose                                                              |
-| -------------- | -------------------------------------------------------------------- |
-| `GROQ_API_KEY` | API key for Groq Cloud. Used by `src/shared/infra/groq/client.ts`.   |
+| Name            | Purpose                                                                                                                                                                                            |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GROQ_API_KEY`  | API key for Groq Cloud. Used by `src/shared/infra/groq/client.ts`. **Required**.                                                                                                                   |
+| `BRAVE_API_KEY` | API key for Brave Search. Used by `src/shared/infra/brave/client.ts` to back the `webSearch` research tool. **Required** for the `webSearch` tool; agent falls back if absent but recommendations will be ungrounded. Free tier: 2,000 queries/month. |
 
-For local dev, put it in `.env` at the project root. For deploys, configure it
-through Alchemy / Cloudflare secrets.
+Context7 (`searchLibraryDocs` tool) uses the public `https://context7.com/api/v1`
+endpoint and requires no API key.
+
+`readUrl` makes outbound `fetch()` calls to whatever URL the agent picks; no
+key required, but bear in mind Cloudflare Workers' egress limits.
+
+For local dev, put secrets in `.env` at the project root. For deploys,
+configure them through Alchemy / Cloudflare secrets.
 
 ## Common scripts
 
