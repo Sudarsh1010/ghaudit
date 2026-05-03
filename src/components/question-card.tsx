@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import type { QuestionAskedEvent } from '~/shared/sse/events'
+import { submitAnswerFn } from '~/server-fns/session'
 
 export type AnswerKind = 'accept' | 'reject' | 'custom'
 
@@ -15,6 +16,12 @@ interface QuestionCardProps {
  *   - Accept     → uses the recommendation as-is
  *   - Reject     → opens a textarea for the rejection reason
  *   - Custom     → opens a textarea for a user-supplied answer
+ *
+ * Submission goes through `submitAnswerFn`, a typed server function
+ * defined in `~/server-fns/session`. The `data` payload is validated
+ * server-side against the same Effect Schema the DO uses for its
+ * `/answer` body, so a shape drift between client and server surfaces
+ * as a typed error rather than a 400.
  */
 export function QuestionCard({
   sessionId,
@@ -31,22 +38,14 @@ export function QuestionCard({
     setSubmitting(true)
     setError(null)
     try {
-      const body =
-        kind === 'accept'
-          ? { kind }
-          : { kind, value: text }
-      const res = await fetch(
-        `/session/${sessionId}/answer/${question.questionId}`,
-        {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(body),
+      await submitAnswerFn({
+        data: {
+          sessionId,
+          questionId: question.questionId,
+          kind,
+          value: kind === 'accept' ? undefined : text,
         },
-      )
-      if (!res.ok) {
-        const j = (await res.json().catch(() => ({}))) as { error?: string }
-        throw new Error(j.error ?? `request failed: ${res.status}`)
-      }
+      })
       setAnswered(true)
       onAnswered?.()
     } catch (err) {

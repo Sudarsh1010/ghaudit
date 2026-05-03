@@ -7,17 +7,18 @@ import {
   type QuestionAskedEvent,
 } from '~/shared/sse/events'
 import { QuestionCard } from '~/components/question-card'
+import { createSessionFn } from '~/server-fns/session'
 
 export const Route = createFileRoute('/')({ component: App })
 
-interface CreateSessionResponse {
-  sessionId: string
-  eventStreamUrl: string
+interface SessionInfo {
+  readonly sessionId: string
+  readonly eventStreamUrl: string
 }
 
 function App() {
   const [prompt, setPrompt] = useState('')
-  const [session, setSession] = useState<CreateSessionResponse | null>(null)
+  const [session, setSession] = useState<SessionInfo | null>(null)
   const [events, setEvents] = useState<Array<AgentEvent>>([])
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
@@ -34,16 +35,12 @@ function App() {
     setSession(null)
     setSubmitting(true)
     try {
-      const res = await fetch('/session', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ initialPrompt: prompt }),
+      // Typed end-to-end: input is validated against the server-side
+      // Schema, the return shape is inferred from the handler — no
+      // `fetch` boilerplate, no `as` cast, no JSON parsing.
+      const created = await createSessionFn({
+        data: { initialPrompt: prompt },
       })
-      if (!res.ok) {
-        const body = (await res.json().catch(() => ({}))) as { error?: string }
-        throw new Error(body.error ?? `request failed: ${res.status}`)
-      }
-      const created = (await res.json()) as CreateSessionResponse
       setSession(created)
 
       const source = new EventSource(created.eventStreamUrl)
